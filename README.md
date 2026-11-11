@@ -20,61 +20,24 @@ Autonomous AI coding agents work best when they can run tools, test commands, an
 
 ---
 
-## Architecture
-
-```mermaid
-sequenceDiagram
-    participant LMDTFY as lmdtfy (Agent / Remote)
-    participant DTFM as dtfm (Workstation)
-    actor Operator as Operator (/dev/tty)
-
-    LMDTFY->>DTFM: ExecRequest(why, cmd, args, cwd) via Unix socket or ssh -R
-    DTFM->>Operator: Prompt approval: [y] Run / [e] Edit / [n] Reject
-    Operator-->>DTFM: Keypress (y / e / n)
-    alt Approved
-        DTFM->>DTFM: Run in dedicated process group
-        DTFM-->>LMDTFY: Stream stdout / stderr
-        DTFM->>LMDTFY: ExecResponse(exit_code)
-    else Rejected / Stale Keystroke / Timeout
-        DTFM->>LMDTFY: ExecResponse(exit_code: 126 / 124)
-    end
-```
-
-- **Interactive Approvals**: Requests are displayed in POSIX shell syntax with stripped terminal control escapes and Trojan Source bidi characters.
-- **Fail-Closed Security**: Dead stdin/EOF, stale keystrokes, and closed client connections immediately reject execution (exit code `126`). Custom environment variables are rejected upfront (`LD_*`, `PATH`, etc.).
-- **Bounded Resources**: Stream messages capped at 4 MB; subprocess output buffers bounded to 1 MB.
-- **Process Isolation**: Grandchild processes run in dedicated process groups and terminate on timeout or cancellation (`SIGKILL`).
-
-> [!IMPORTANT]
-> **Trust Model**: `dtfm` is a human-in-the-loop safety gate ("seatbelt") designed to prevent accidental misuse or unintended commands from AI agents in environments you control. Approved commands run **unsandboxed** with your local user privileges, and terminal sanitization is best-effort — **do not** expose or forward the `dtfm` socket to untrusted hosts or third parties, and always review commands before approving.
-
----
-
-## Installation & Build
-
-### Prebuilt Binaries
-Hermetic static binaries are available on [GitHub Releases](https://github.com/iinozemtsev-lab/dtfm/releases) for `darwin-arm64`, `darwin-amd64`, `linux-amd64`, and `linux-arm64`:
-```bash
-curl -fLO https://github.com/iinozemtsev-lab/dtfm/releases/download/v0.2.0/dtfm_0.2.0_linux_amd64.tar.gz
-mkdir -p ~/.local/bin
-tar -xzf dtfm_0.2.0_linux_amd64.tar.gz dtfm lmdtfy
-install -m 0755 dtfm lmdtfy ~/.local/bin/ && rm -f dtfm lmdtfy dtfm_0.2.0_linux_amd64.tar.gz
-```
-
-*(Ensure `~/.local/bin` is in your `$PATH`.)*
-
-### Build from Source (Go 1.22+)
-```bash
-make        # Build local binaries in bin/
-make test   # Run unit tests with race detection
-make cross  # Cross-compile release binaries
-```
-
----
-
 ## Quickstart
 
-### 1. Operator: Start Approval Listener
+### 1. Operator: Install & Start Approval Listener
+
+Install the static `dtfm` binary into `~/.local/bin` (Linux & macOS, `amd64` & `arm64`):
+
+```bash
+os=$(uname -s | tr '[:upper:]' '[:lower:]')
+arch=$(uname -m | sed -e 's/x86_64/amd64/' -e 's/aarch64/arm64/')
+tmp=$(mktemp) && mkdir -p ~/.local/bin && \
+  curl -fsSL "https://github.com/iinozemtsev-lab/dtfm/releases/latest/download/dtfm-${os}-${arch}" -o "$tmp" && \
+  install -m 0755 "$tmp" ~/.local/bin/dtfm && rm -f "$tmp"
+```
+
+*(Ensure `~/.local/bin` is in your `$PATH`, or [build from source](#build-from-source-go-122) below.)*
+
+Start the approval listener on your workstation:
+
 ```bash
 # Listen on default socket (/run/user/<uid>/lmdtfy.sock on Linux, ~/.lmdtfy.sock on macOS)
 dtfm
@@ -128,7 +91,17 @@ lmdtfy exec --relay "https://<relay-host>/c/<session-id>#<key>" --why "run migra
 
 </details>
 
-### 3. Agent: Check Connectivity & Execute
+### 3. Hand Off to Your Agent
+
+Paste this into your agent's chat (it will install `lmdtfy` if needed and verify connectivity):
+
+```text
+I have dtfm running. Read https://raw.githubusercontent.com/iinozemtsev-lab/dtfm/main/docs/lmdtfy_guide.md, install lmdtfy if needed, ping me to verify the connection, and route any privileged or host commands through it.
+```
+
+<details>
+<summary><b>Or run <code>lmdtfy</code> directly from a shell</b></summary>
+
 ```bash
 # Verify connection to active operator session (exit code 0 if ready, 2 if inactive)
 lmdtfy ping
@@ -138,6 +111,52 @@ lmdtfy exec --why "Install project dependencies" npm install
 
 # Custom working directory or review timeout (seconds)
 lmdtfy exec --why "Run test suite" --cwd /opt/project --timeout 120 pytest
+```
+
+</details>
+
+---
+
+## Architecture
+
+```mermaid
+sequenceDiagram
+    participant LMDTFY as lmdtfy (Agent / Remote)
+    participant DTFM as dtfm (Workstation)
+    actor Operator as Operator (/dev/tty)
+
+    LMDTFY->>DTFM: ExecRequest(why, cmd, args, cwd) via Unix socket or ssh -R
+    DTFM->>Operator: Prompt approval: [y] Run / [e] Edit / [n] Reject
+    Operator-->>DTFM: Keypress (y / e / n)
+    alt Approved
+        DTFM->>DTFM: Run in dedicated process group
+        DTFM-->>LMDTFY: Stream stdout / stderr
+        DTFM->>LMDTFY: ExecResponse(exit_code)
+    else Rejected / Stale Keystroke / Timeout
+        DTFM->>LMDTFY: ExecResponse(exit_code: 126 / 124)
+    end
+```
+
+- **Interactive Approvals**: Requests are displayed in POSIX shell syntax with stripped terminal control escapes and Trojan Source bidi characters.
+- **Fail-Closed Security**: Dead stdin/EOF, stale keystrokes, and closed client connections immediately reject execution (exit code `126`). Custom environment variables are rejected upfront (`LD_*`, `PATH`, etc.).
+- **Bounded Resources**: Stream messages capped at 4 MB; subprocess output buffers bounded to 1 MB.
+- **Process Isolation**: Grandchild processes run in dedicated process groups and terminate on timeout or cancellation (`SIGKILL`).
+
+> [!IMPORTANT]
+> **Trust Model**: `dtfm` is a human-in-the-loop safety gate ("seatbelt") designed to prevent accidental misuse or unintended commands from AI agents in environments you control. Approved commands run **unsandboxed** with your local user privileges, and terminal sanitization is best-effort — **do not** expose or forward the `dtfm` socket to untrusted hosts or third parties, and always review commands before approving.
+
+---
+
+## Installation & Build
+
+### Prebuilt Release Archives
+Standalone static binaries and reproducible `.tar.gz` archives (`dtfm`, `lmdtfy`, and `relay`) with `SHA256SUMS` are published on [GitHub Releases](https://github.com/iinozemtsev-lab/dtfm/releases) for `darwin-arm64`, `darwin-amd64`, `linux-amd64`, and `linux-arm64`.
+
+### Build from Source (Go 1.22+)
+```bash
+make        # Build local binaries in bin/
+make test   # Run unit tests with race detection
+make cross  # Cross-compile release binaries
 ```
 
 ---
