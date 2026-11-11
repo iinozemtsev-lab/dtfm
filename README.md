@@ -12,9 +12,9 @@
 
 Autonomous AI coding agents work best when they can run tools, test commands, and inspect environments directly. However, giving an agent full shell access or copying master credentials into an agent container creates severe security and operational friction. `dtfm` bridges this boundary with human-in-the-loop verification across three concrete developer scenarios:
 
-- **Keep secrets out of agent sandboxes**: Workstations hold master cloud credentials (`gcloud`, `aws`, `kubectl`, `1Password`, `gh`), while AI agents run in sandboxes (Docker, VMs, Codespaces). Copying credentials into the sandbox is dangerous; manual copy-pasting breaks agent flow. `dtfm` allows the agent to run `lmdtfy exec --why ...`, executing on the host with 1-click approval (`[y]`) and zero leaked tokens.
-- **Supervised driving on remote servers**: Tweaking a remote VPS (Nginx, systemd, firewall). The agent does the heavy typing and thinking, but the human keeps a foot on the brake via `[y] Run / [e] Edit / [n] Reject` rather than giving an LLM unchecked root/sudo SSH access.
-- **Zero-trust remote pairing & assistance**: Assisting a peer or family member with terminal tasks with per-command confirmation instead of clumsy screen-sharing or wide-open SSH.
+- **Keep secrets out of agent sandboxes**: Workstations hold master cloud credentials (`gcloud`, `aws`, `kubectl`, `1Password`, `gh`), while AI agents run in sandboxes (Docker, VMs, Codespaces). Copying credentials into the sandbox is dangerous; manual copy-pasting breaks agent flow. `dtfm` lets the agent run `lmdtfy exec --why ...`, executing on the host after explicit terminal approval (`[y]`) with zero leaked tokens.
+- **Supervised driving on remote servers**: Configure or debug a remote VPS (Nginx, systemd, firewall) with `dtfm` running in your SSH session — the agent does the heavy typing and diagnostics while you keep a foot on the brake via `[y] Run / [e] Edit / [n] Reject` rather than granting an LLM unchecked root or `sudo` access.
+- **Zero-trust remote pairing & assistance**: Assist a peer or family member on terminal tasks with per-command confirmation instead of clumsy screen-sharing or wide-open SSH.
 
 ---
 
@@ -59,14 +59,14 @@ dtfm ssh-config ubuntu@agent-vm --write
 ssh agent-vm
 ```
 
-*(Or ad-hoc without editing `~/.ssh/config`: `ssh -R /run/user/<remote_uid>/lmdtfy.sock:<local_socket> ubuntu@agent-vm`)*
+*(Or ad-hoc without editing `~/.ssh/config`: `ssh -o StreamLocalBindUnlink=yes -R /run/user/<remote_uid>/lmdtfy.sock:<local_socket> ubuntu@agent-vm`)*
 
 </details>
 
 <details>
 <summary><b>Same Machine or Local Container</b> — shared local Unix socket</summary>
 
-`lmdtfy` connects automatically to the default local socket path (for containers, bind-mount the socket and set `LMDTFY_SOCKET` if UIDs differ).
+`lmdtfy` connects automatically to the default local socket path (for containers, bind-mount the socket — e.g. to `/run/lmdtfy.sock` — and set `LMDTFY_SOCKET`; on Linux, match the host UID or run as root).
 
 </details>
 
@@ -107,7 +107,7 @@ lmdtfy ping
 # Dispatch command for human review and execution
 lmdtfy exec --why "Install project dependencies" npm install
 
-# Custom working directory or review timeout (seconds)
+# Custom working directory or review/execution timeout (seconds)
 lmdtfy exec --why "Run test suite" --cwd /opt/project --timeout 120 pytest
 ```
 
@@ -136,19 +136,19 @@ sequenceDiagram
 
     LMDTFY->>DTFM: ExecRequest(why, cmd, args, cwd) via Unix socket, ssh -R, or E2EE relay
     DTFM->>Operator: Prompt approval: [y] Run / [e] Edit / [n] Reject
-    Operator-->>DTFM: Keypress (y / e / n)
+    Operator-->>DTFM: Decision (y / e / n + Enter)
     alt Approved or Edited
         DTFM->>Operator: Run in isolated process group (live terminal output)
         DTFM->>LMDTFY: ExecResponse(exit_code, captured stdout/stderr)
-    else Rejected / Stale Keystroke / Timeout
+    else Rejected / Disconnected / Timeout
         DTFM->>LMDTFY: ExecResponse(exit_code: 126 / 124)
     end
 ```
 
-- **Interactive Approvals & Inline Editing**: Requests are displayed in POSIX shell syntax with stripped terminal control escapes and Trojan Source bidi characters. Operators can edit commands inline via readline (`[e]`) before running, and pending TTY input is flushed prior to prompting so pre-typed keystrokes cannot auto-approve requests.
-- **Fail-Closed Security**: Dead stdin/EOF, stale keystrokes, and closed client connections immediately reject execution (exit code `126`). Custom environment variables are rejected upfront (`LD_*`, `PATH`, etc.).
+- **Interactive Approvals & Inline Editing**: Requests are displayed in lossless POSIX / ANSI-C (`$'...'`) shell syntax with visibly escaped terminal control codes and Trojan Source bidi characters. Operators can edit commands inline with Readline-style keybindings (`[e]`) before running, and pending TTY input is flushed prior to prompting so pre-typed keystrokes cannot auto-approve requests.
+- **Fail-Closed Security**: Dead stdin/EOF, backgrounded TTYs, TTY input-flush errors, and closed client connections immediately reject execution (exit code `126`). Any custom environment variables are rejected upfront (e.g., `LD_*`, `PATH`).
 - **Bounded Resources**: Request frames are capped at 4 MiB; captured `stdout` and `stderr` are bounded to 1 MiB per stream (16 MiB max serialized response envelope).
-- **Process Isolation**: Grandchild processes run in dedicated process groups and terminate on timeout or cancellation (`SIGKILL`).
+- **Process Isolation**: Child and grandchild processes run in dedicated process groups and terminate on timeout or cancellation (`SIGKILL`).
 
 > [!IMPORTANT]
 > **Trust Model**: `dtfm` is a human-in-the-loop safety gate ("seatbelt") designed to prevent accidental misuse or unintended commands from AI agents in environments you control. Approved commands run **unsandboxed** with your local user privileges, and terminal sanitization is best-effort — **do not** expose or forward the `dtfm` socket (or share relay pairing links) with untrusted hosts or third parties, and always review commands before approving.
@@ -162,9 +162,9 @@ Standalone static binaries and reproducible `.tar.gz` archives (`dtfm`, `lmdtfy`
 
 ### Build from Source (Go 1.22+)
 ```bash
-make        # Build local binaries in bin/
-make test   # Run unit tests with race detection
-make cross  # Cross-compile release binaries
+make build  # Build local static binaries in bin/
+make test   # Run unit tests (-race) and script checks
+make cross  # Cross-compile release binaries in bin/dist/
 ```
 
 ---
@@ -172,28 +172,31 @@ make cross  # Cross-compile release binaries
 ## CLI Reference
 
 - `dtfm [--socket <path>]`: Start approval server on default socket (or specified path).
-- `dtfm --relay [--relay-url <url>] [--hub-url <url>] [--session <id>]`: Start in-memory E2EE WebSocket relay session.
+- `dtfm --relay [--relay-url <url>] [--hub-url <url>] [--session <id>]`: Start in-memory E2EE WebSocket relay session (`--relay-url` required when self-hosting).
 - `dtfm ssh-config <host> [-w|--write] [--socket <path>] [--config <path>]`: Generate or atomically write `~/.ssh/config` `RemoteForward` block.
 - `lmdtfy ping [--socket <path>] [--relay <token-or-url>] [--relay-url <url>]`: Test operator listener connectivity.
-- `lmdtfy exec --why "<reason>" [--socket <path>] [--relay <token-or-url>] [--relay-url <url>] [--timeout <sec>] [--cwd <path>] <cmd>...`: Dispatch command for human review (`--timeout` defaults to `300s`, bounding review and execution separately).
+- `lmdtfy exec --why "<reason>" [--socket <path>] [--relay <token-or-url>] [--relay-url <url>] [--timeout <sec>] [--cwd <path>] <cmd>...`: Dispatch command for human review (`--timeout` defaults to `300` seconds, max `86400`, bounding review and execution separately).
 - `relay [--listen <addr>] [--idle-timeout <dur>] [--max-sessions <n>] [--max-sessions-per-ip <n>] [--trusted-proxies <cidrs>] [--verbose]`: Standalone in-memory WebSocket streaming relay server (`cmd/relay`).
 - `dtfm --version` / `lmdtfy --version` / `relay --version`: Display version information.
 
 ### Environment Variables
 
-| Variable | Description |
-|---|---|
-| `LMDTFY_SOCKET` | Default socket path when `--socket` flag is omitted |
-| `LMDTFY_RELAY` | Default relay token or URL when `--relay` flag is omitted |
-| `LMDTFY_RELAY_URL` | Default relay endpoint URL when `--relay-url` flag is omitted |
+| Variable | Applies To | Description |
+|---|---|---|
+| `LMDTFY_SOCKET` | `dtfm`, `lmdtfy` | Default socket path when `--socket` flag is omitted |
+| `LMDTFY_RELAY` | `lmdtfy` | Default relay token or URL when `--relay` flag is omitted |
+| `LMDTFY_RELAY_URL` | `lmdtfy` | Default relay endpoint URL when `--relay-url` flag is omitted |
+| `NO_COLOR` | `dtfm` | Disable ANSI colors in interactive terminal prompts when non-empty |
 
 ---
 
 ## Exit Codes
 
+Approved commands forward the executed process's exit code (`0–255`) verbatim. Gateway-specific exit codes:
+
 | Code | Meaning |
 |:---:|---|
-| `0` | Success (or exit code of executed command) |
+| `0` | Success (`ping` active, or approved command exited `0`) |
 | `1` | General CLI error or protocol violation |
 | `2` | Session inactive (`dtfm` listener unreachable) |
 | `124` | Execution or review timed out |
