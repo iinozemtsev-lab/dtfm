@@ -3,10 +3,8 @@
 **Teleport your agent. Instantly. Precisely.**  
 *Execute commands on your machine or servers from sandboxed AI agents — without sharing your credentials.*
 
-Human-in-the-loop (HITL) execution gateway and CLI dispatcher for autonomous AI agents and remote engineers:
-
-- `dtfm` (*Do That For Me*) runs on the operator's workstation, listening on a secure Unix domain socket and prompting the operator for approval before executing commands.
-- `lmdtfy` (*Let Me Do That For You*) runs inside the agent's environment (local container, VM, or remote server over SSH), dispatching commands to `dtfm` with an explicit reason (`--why`).
+- `dtfm` (*Do That For Me*) runs on your workstation or target host, listening over a local Unix socket or end-to-end encrypted (E2EE) WebSocket relay and prompting you for approval before running any command.
+- `lmdtfy` (*Let Me Do That For You*) runs inside the agent's environment (SSH-reachable VM, local container, or cloud sandbox), dispatching commands to `dtfm` with an explicit reason (`--why`).
 
 ---
 
@@ -14,7 +12,7 @@ Human-in-the-loop (HITL) execution gateway and CLI dispatcher for autonomous AI 
 
 Autonomous AI coding agents work best when they can run tools, test commands, and inspect environments directly. However, giving an agent full shell access or copying master credentials into an agent container creates severe security and operational friction. `dtfm` bridges this boundary with human-in-the-loop verification across three concrete developer scenarios:
 
-- **Keep secrets out of agent sandboxes (The Cloud CLI Dilemma)**: Workstations hold master cloud credentials (`gcloud`, `aws`, `kubectl`, `1Password`, `gh`), while AI agents run in sandboxes (Docker, VMs, Codespaces). Copying credentials into the sandbox is dangerous; manual copy-pasting breaks agent flow. `dtfm` allows the agent to run `lmdtfy exec --why ...`, executing on the host with 1-click approval (`[y]`) and zero leaked tokens.
+- **Keep secrets out of agent sandboxes**: Workstations hold master cloud credentials (`gcloud`, `aws`, `kubectl`, `1Password`, `gh`), while AI agents run in sandboxes (Docker, VMs, Codespaces). Copying credentials into the sandbox is dangerous; manual copy-pasting breaks agent flow. `dtfm` allows the agent to run `lmdtfy exec --why ...`, executing on the host with 1-click approval (`[y]`) and zero leaked tokens.
 - **Supervised driving on remote servers**: Tweaking a remote VPS (Nginx, systemd, firewall). The agent does the heavy typing and thinking, but the human keeps a foot on the brake via `[y] Run / [e] Edit / [n] Reject` rather than giving an LLM unchecked root/sudo SSH access.
 - **Zero-trust remote pairing & assistance**: Assisting a peer or family member with terminal tasks with per-command confirmation instead of clumsy screen-sharing or wide-open SSH.
 
@@ -78,8 +76,8 @@ ssh agent-vm
 Bridge across NATs without inbound SSH using the included zero-knowledge E2EE `relay` server:
 
 ```bash
-# 1. Run the stateless in-memory relay on any HTTPS/WSS endpoint:
-relay --listen 127.0.0.1:8080
+# 1. Run the stateless in-memory relay behind any HTTPS/WSS endpoint (default listen: :8088):
+relay --listen 127.0.0.1:8088
 
 # 2. Operator connects to the relay (prints E2EE pairing token and Magic Link):
 dtfm --relay --relay-url wss://<relay-host>/ws
@@ -115,6 +113,17 @@ lmdtfy exec --why "Run test suite" --cwd /opt/project --timeout 120 pytest
 
 </details>
 
+When your agent dispatches a command, `dtfm` prompts on your terminal before anything runs:
+
+```text
+────────────────────────────────────────────────────────────
+🔔 LMDTFY Command Execution Request:
+   Reason:  Deploy staging worker
+   Command: gcloud run deploy worker --region europe-west6
+────────────────────────────────────────────────────────────
+Approve execution? [y] Run  [e] Edit  [n] Reject:
+```
+
 ---
 
 ## Architecture
@@ -125,25 +134,24 @@ sequenceDiagram
     participant DTFM as dtfm (Workstation)
     actor Operator as Operator (/dev/tty)
 
-    LMDTFY->>DTFM: ExecRequest(why, cmd, args, cwd) via Unix socket or ssh -R
+    LMDTFY->>DTFM: ExecRequest(why, cmd, args, cwd) via Unix socket, ssh -R, or E2EE relay
     DTFM->>Operator: Prompt approval: [y] Run / [e] Edit / [n] Reject
     Operator-->>DTFM: Keypress (y / e / n)
-    alt Approved
-        DTFM->>DTFM: Run in dedicated process group
-        DTFM-->>LMDTFY: Stream stdout / stderr
-        DTFM->>LMDTFY: ExecResponse(exit_code)
+    alt Approved or Edited
+        DTFM->>Operator: Run in isolated process group (live terminal output)
+        DTFM->>LMDTFY: ExecResponse(exit_code, captured stdout/stderr)
     else Rejected / Stale Keystroke / Timeout
         DTFM->>LMDTFY: ExecResponse(exit_code: 126 / 124)
     end
 ```
 
-- **Interactive Approvals**: Requests are displayed in POSIX shell syntax with stripped terminal control escapes and Trojan Source bidi characters.
+- **Interactive Approvals & Inline Editing**: Requests are displayed in POSIX shell syntax with stripped terminal control escapes and Trojan Source bidi characters. Operators can edit commands inline via readline (`[e]`) before running, and pending TTY input is flushed prior to prompting so pre-typed keystrokes cannot auto-approve requests.
 - **Fail-Closed Security**: Dead stdin/EOF, stale keystrokes, and closed client connections immediately reject execution (exit code `126`). Custom environment variables are rejected upfront (`LD_*`, `PATH`, etc.).
-- **Bounded Resources**: Stream messages capped at 4 MB; subprocess output buffers bounded to 1 MB.
+- **Bounded Resources**: Request frames are capped at 4 MiB; captured `stdout` and `stderr` are bounded to 1 MiB per stream (16 MiB max serialized response envelope).
 - **Process Isolation**: Grandchild processes run in dedicated process groups and terminate on timeout or cancellation (`SIGKILL`).
 
 > [!IMPORTANT]
-> **Trust Model**: `dtfm` is a human-in-the-loop safety gate ("seatbelt") designed to prevent accidental misuse or unintended commands from AI agents in environments you control. Approved commands run **unsandboxed** with your local user privileges, and terminal sanitization is best-effort — **do not** expose or forward the `dtfm` socket to untrusted hosts or third parties, and always review commands before approving.
+> **Trust Model**: `dtfm` is a human-in-the-loop safety gate ("seatbelt") designed to prevent accidental misuse or unintended commands from AI agents in environments you control. Approved commands run **unsandboxed** with your local user privileges, and terminal sanitization is best-effort — **do not** expose or forward the `dtfm` socket (or share relay pairing links) with untrusted hosts or third parties, and always review commands before approving.
 
 ---
 
@@ -167,9 +175,9 @@ make cross  # Cross-compile release binaries
 - `dtfm --relay [--relay-url <url>] [--hub-url <url>] [--session <id>]`: Start in-memory E2EE WebSocket relay session.
 - `dtfm ssh-config <host> [-w|--write] [--socket <path>] [--config <path>]`: Generate or atomically write `~/.ssh/config` `RemoteForward` block.
 - `lmdtfy ping [--socket <path>] [--relay <token-or-url>] [--relay-url <url>]`: Test operator listener connectivity.
-- `lmdtfy exec --why "<reason>" [--socket <path>] [--relay <token-or-url>] [--relay-url <url>] [--timeout <sec>] [--cwd <path>] <cmd>...`: Dispatch command for human review.
-- `relay [--listen <addr>] [--idle-timeout <dur>] [--max-sessions <n>] [--max-sessions-per-ip <n>] [--trusted-proxies <cidrs>]`: Standalone in-memory WebSocket streaming relay server (`cmd/relay`).
-- `dtfm --version` / `lmdtfy --version`: Display version information.
+- `lmdtfy exec --why "<reason>" [--socket <path>] [--relay <token-or-url>] [--relay-url <url>] [--timeout <sec>] [--cwd <path>] <cmd>...`: Dispatch command for human review (`--timeout` defaults to `300s`, bounding review and execution separately).
+- `relay [--listen <addr>] [--idle-timeout <dur>] [--max-sessions <n>] [--max-sessions-per-ip <n>] [--trusted-proxies <cidrs>] [--verbose]`: Standalone in-memory WebSocket streaming relay server (`cmd/relay`).
+- `dtfm --version` / `lmdtfy --version` / `relay --version`: Display version information.
 
 ### Environment Variables
 
