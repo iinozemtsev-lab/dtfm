@@ -10,11 +10,13 @@ Releases adhere strictly to [Semantic Versioning (SemVer 2.0.0)](https://semver.
 
 - Write access to the repository (`iinozemtsev-lab/dtfm`).
 - Maintainer permissions to trigger GitHub Actions workflows or push tags to `upstream`.
+- **Workflow Permissions & Sigstore Attestations**:
+  - The release pipeline requires `id-token: write` and `attestations: write` permissions in `verify-and-build` to mint cryptographic GitHub OIDC tokens and sign SLSA build provenance attestations via Sigstore.
 - **Branch Protection & `GITHUB_TOKEN` Semantics**:
   - **Option A (`workflow_dispatch`)** requires `main` to permit direct fast-forward pushes from `github-actions[bot]` (`secrets.GITHUB_TOKEN`). If `main` branch protection or repository rulesets require pull requests before merging, use **Option B** via a changelog-prep pull request to `main` and then push the annotated release tag onto the merged commit.
   - Both the deferred changelog push to `main` and the `publish` job **must** continue authenticating with `secrets.GITHUB_TOKEN` (rather than a Personal Access Token or GitHub App token) so that automated commits and tag creation on release publish do not trigger recursive `ci.yml` runs or duplicate `on: push: tags:` `release.yml` runs.
   - Release commit messages intentionally omit `[skip ci]` (`chore(release): finalize changelog for <TAG>`), because GitHub Actions evaluates `[skip ci]` on `head_commit.message` for tag pushes (`on: push: tags: ['v*']`) as well and would silently skip `release.yml` under Option B.
-- Local tools (optional if releasing via Web UI): `git`, Go 1.22+, `python3`, and GitHub CLI (`gh`).
+- Local tools (optional if releasing via Web UI): `git`, Go 1.22+, `python3`, and GitHub CLI (`gh` v2.49.0+ for `gh attestation verify`).
 
 ---
 
@@ -129,6 +131,9 @@ When triggered, [`.github/workflows/release.yml`](../.github/workflows/release.y
 11. **Deferred Push to `origin/main` (`workflow_dispatch`)**:
     When `Finalize CHANGELOG.md locally` created a commit (`NEEDS_MAIN_PUSH == 'true'`), re-verifies that no release or remote tag for `$TAG` appeared during the build, then pushes `HEAD:refs/heads/main` right before uploading release artifacts.
 
+12. **Cryptographic Artifact Attestations & SLSA Build Provenance**:
+    Generates cryptographically signed SLSA v1.0 build provenance attestations for all published distribution archives, standalone binaries, and checksum files in `artifacts/*` using `actions/attest-build-provenance@v2`. Uses GitHub's ephemeral OIDC tokens (`id-token: write`, `attestations: write`) for keyless signing via Sigstore and transparent recording in the public ledger, guaranteeing that binaries originated from an untampered commit in `iinozemtsev-lab/dtfm`.
+
 ### Phase 2: Live Release Publishing (`publish`)
 
 1. **Strict `RELEASE_SHA` & Checksum Re-Verification**:
@@ -151,21 +156,30 @@ When triggered, [`.github/workflows/release.yml`](../.github/workflows/release.y
 
 ## Post-Release Verification
 
-After release publication, verify the assets:
+After release publication, verify the assets, integrity checksums, and cryptographic build provenance attestations:
 
 ```bash
 # Inspect release metadata
-gh release view v0.2.0 --repo iinozemtsev-lab/dtfm
+gh release view v0.3.0 --repo iinozemtsev-lab/dtfm
 
 # Download archive and checksums
-curl -fLO https://github.com/iinozemtsev-lab/dtfm/releases/download/v0.2.0/dtfm_0.2.0_linux_amd64.tar.gz
-curl -fLO https://github.com/iinozemtsev-lab/dtfm/releases/download/v0.2.0/SHA256SUMS
+curl -fLO https://github.com/iinozemtsev-lab/dtfm/releases/download/v0.3.0/dtfm_0.3.0_linux_amd64.tar.gz
+curl -fLO https://github.com/iinozemtsev-lab/dtfm/releases/download/v0.3.0/SHA256SUMS
 
-# Verify integrity
+# 1. Verify download integrity via SHA-256 checksums
 sha256sum --ignore-missing -c SHA256SUMS
 
-# Verify version string
-tar -xzf dtfm_0.2.0_linux_amd64.tar.gz
+# 2. Verify cryptographic build provenance & SLSA attestation
+gh attestation verify dtfm_0.3.0_linux_amd64.tar.gz --repo iinozemtsev-lab/dtfm
+gh attestation verify SHA256SUMS --repo iinozemtsev-lab/dtfm
+
+# Optional: strictly enforce the signer workflow path
+gh attestation verify dtfm_0.3.0_linux_amd64.tar.gz \
+  --repo iinozemtsev-lab/dtfm \
+  --signer-workflow iinozemtsev-lab/dtfm/.github/workflows/release.yml
+
+# 3. Verify version string
+tar -xzf dtfm_0.3.0_linux_amd64.tar.gz
 ./dtfm --version
 ./lmdtfy --version
 ./relay --version
