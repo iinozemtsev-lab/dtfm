@@ -167,6 +167,7 @@ class InstallScriptTests(unittest.TestCase):
         ):
             env.pop(key, None)
         env["DTFM_GITHUB_URL"] = self.server.url
+        env["POSIXLY_CORRECT"] = "1"
         if extra:
             env.update(extra)
         return env

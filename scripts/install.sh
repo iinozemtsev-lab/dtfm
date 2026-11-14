@@ -88,7 +88,7 @@ EOF
             ""|.|..|[!0-9A-Za-z]*|*[!0-9A-Za-z]) return 1 ;;
         esac
         case "$repo_name" in
-            ""|.|..|[!0-9A-Za-z]*|*[!0-9A-Za-z]) return 1 ;;
+            ""|.|..|-*) return 1 ;;
         esac
         return 0
     }
@@ -372,7 +372,7 @@ EOF
         exit 0
     fi
 
-    TMP_DIR="$(mktemp -d)" </dev/null
+    TMP_DIR="$(mktemp -d </dev/null)"
     BASE_URL="${GITHUB_URL}/${REPO}/releases/download/${TAG}"
     SUMS_PATH="${TMP_DIR}/SHA256SUMS"
 
@@ -395,9 +395,9 @@ EOF
     mkdir -p -- "$DEST" </dev/null
     for bin in $TO_INSTALL; do
         asset="$(asset_for_bin "$bin")"
-        STAGE_FILE="$(mktemp "${DEST}/.${bin}.tmp.XXXXXX")" </dev/null
+        STAGE_FILE="$(mktemp "${DEST}/.${bin}.tmp.XXXXXX" </dev/null)"
         cp -- "${TMP_DIR}/${asset}" "$STAGE_FILE" </dev/null
-        chmod 0755 -- "$STAGE_FILE" </dev/null
+        chmod 0755 "$STAGE_FILE" </dev/null
         if [ -L "${DEST}/${bin}" ] && [ -d "${DEST}/${bin}" ]; then
             rm -f -- "${DEST}/${bin}" </dev/null
         fi
