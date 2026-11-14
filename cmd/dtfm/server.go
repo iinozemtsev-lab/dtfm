@@ -401,6 +401,8 @@ func isSocketClosed(conn net.Conn) bool {
 			}
 			if rn == 0 && rerr == nil {
 				closed = true
+			} else if rn > 0 && rerr == nil && hasQueuedPeerEOF(fd) {
+				closed = true
 			} else if errors.Is(rerr, syscall.ECONNRESET) ||
 				errors.Is(rerr, syscall.EPIPE) ||
 				errors.Is(rerr, syscall.ENOTCONN) ||
@@ -457,7 +459,7 @@ func watchDisconnect(conn net.Conn, br *bufio.Reader, cancel context.CancelCause
 			}
 
 			buffered := br.Buffered()
-			if buffered > 0 && isSocketClosed(conn) {
+			if (buffered > 0 || hasCustomCloseCheck) && isSocketClosed(conn) {
 				signalDisconnect()
 				return
 			}

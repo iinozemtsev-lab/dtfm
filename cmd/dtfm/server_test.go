@@ -1577,13 +1577,48 @@ func TestWatchDisconnectBufferedDataOnNetPipe(t *testing.T) {
 	}
 }
 
+func TestWatchDisconnectRelayConnFailClosedZeroBuffered(t *testing.T) {
+	c1, c2 := net.Pipe()
+	defer c1.Close()
+	defer c2.Close()
+
+	rc := &mockRelayConn{Conn: c1}
+	br := bufio.NewReader(rc)
+	if br.Buffered() != 0 {
+		t.Fatalf("expected br.Buffered() == 0, got %d", br.Buffered())
+	}
+
+	ctx, cancel := context.WithCancelCause(context.Background())
+	stop, disconnected := watchDisconnect(rc, br, cancel, context.Background())
+	defer stop()
+
+	// Let watchDisconnect enter its first Peek iteration with br.Buffered() == 0,
+	// then flip IsClosedOrEOF() without closing the underlying net.Pipe.
+	time.Sleep(15 * time.Millisecond)
+	rc.closed.Store(true)
+
+	select {
+	case <-disconnected:
+	case <-time.After(500 * time.Millisecond):
+		t.Fatal("watchDisconnect spun without detecting IsClosedOrEOF() when br.Buffered() == 0")
+	}
+
+	if !errors.Is(context.Cause(ctx), ErrClientDisconnected) {
+		t.Fatalf("expected ErrClientDisconnected, got: %v", context.Cause(ctx))
+	}
+}
+
 func TestWatchDisconnectFullBufferUnixConn(t *testing.T) {
-	for _, halfClose := range []bool{false, true} {
-		name := "full_close"
-		if halfClose {
-			name = "half_close_write"
-		}
-		t.Run(name, func(t *testing.T) {
+	for _, tc := range []struct {
+		name             string
+		halfClose        bool
+		extraKernelBytes int
+	}{
+		{name: "full_close", halfClose: false, extraKernelBytes: 0},
+		{name: "half_close_write", halfClose: true, extraKernelBytes: 0},
+		{name: "half_close_with_unread_kernel_bytes", halfClose: true, extraKernelBytes: 1024},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
 			tmpDir := shortTempSockDir(t)
 			sockPath := filepath.Join(tmpDir, "s.sock")
 
@@ -1611,7 +1646,7 @@ func TestWatchDisconnectFullBufferUnixConn(t *testing.T) {
 
 			const bufSize = 64
 			br := bufio.NewReaderSize(srv, bufSize)
-			expected := strings.Repeat("X", bufSize)
+			expected := strings.Repeat("X", bufSize+tc.extraKernelBytes)
 			if _, err := cli.Write([]byte(expected)); err != nil {
 				t.Fatalf("Write failed: %v", err)
 			}
@@ -1626,7 +1661,7 @@ func TestWatchDisconnectFullBufferUnixConn(t *testing.T) {
 			stop, disconnected := watchDisconnect(srv, br, cancel, context.Background())
 			defer stop()
 
-			if halfClose {
+			if tc.halfClose {
 				_ = cli.(*net.UnixConn).CloseWrite()
 			} else {
 				_ = cli.Close()
@@ -1635,7 +1670,7 @@ func TestWatchDisconnectFullBufferUnixConn(t *testing.T) {
 			select {
 			case <-disconnected:
 			case <-time.After(500 * time.Millisecond):
-				t.Fatalf("watchDisconnect failed to detect %s when bufio.Reader buffer was full", name)
+				t.Fatalf("watchDisconnect failed to detect %s when bufio.Reader buffer was full", tc.name)
 			}
 
 			if !errors.Is(context.Cause(ctx), ErrClientDisconnected) {
@@ -1643,12 +1678,12 @@ func TestWatchDisconnectFullBufferUnixConn(t *testing.T) {
 			}
 
 			stop()
-			rest := make([]byte, bufSize)
+			rest := make([]byte, len(expected))
 			if _, err := io.ReadFull(br, rest); err != nil {
-				t.Fatalf("ReadFull buffered bytes failed: %v", err)
+				t.Fatalf("ReadFull buffered+kernel bytes failed: %v", err)
 			}
 			if string(rest) != expected {
-				t.Fatalf("buffered bytes corrupted: got %q, want %q", string(rest), expected)
+				t.Fatalf("stream bytes corrupted: len=%d, want len=%d", len(rest), len(expected))
 			}
 		})
 	}
@@ -2173,5 +2208,158 @@ func TestServerMalformedJSONReturnsTypeErrorSilently(t *testing.T) {
 	}
 	if outBuf.String() != "" {
 		t.Fatalf("unexpected executor output on malformed wire frame: %q", outBuf.String())
+	}
+}
+
+func TestServerPersistentConnectionPipelining(t *testing.T) {
+	// Sends exec + exec + ping in a single conn.Write across < 512B, ~1.5KB, and > 4KB
+	// payload sizes, verifying zero stolen/corrupted bytes and no false disconnects
+	// across json.Decoder internal buffering, partial bufio.Reader compaction, and full 4KB+ buffers.
+	for _, tc := range []struct {
+		name    string
+		padSize int
+		minLen  int
+		maxLen  int
+	}{
+		{name: "under_512B", padSize: 2, minLen: 1, maxLen: 500},
+		{name: "around_1_5KB", padSize: 1100, minLen: 1200, maxLen: 2000},
+		{name: "over_4KB", padSize: 5200, minLen: 5400, maxLen: 8000},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			tmpDir := shortTempSockDir(t)
+			sockPath := filepath.Join(tmpDir, "s.sock")
+
+			listener, err := net.Listen("unix", sockPath)
+			if err != nil {
+				t.Fatalf("Listen failed: %v", err)
+			}
+			defer listener.Close()
+
+			prompter := &mockPrompter{
+				decision: DecisionApprove,
+				delay:    65 * time.Millisecond,
+			}
+			server := NewServerWithExecutor(listener, prompter, NewCommandExecutor(io.Discard, io.Discard))
+			startTestServer(t, server)
+
+			conn, err := net.Dial("unix", sockPath)
+			if err != nil {
+				t.Fatalf("Dial failed: %v", err)
+			}
+			defer conn.Close()
+
+			var batch bytes.Buffer
+			enc := json.NewEncoder(&batch)
+
+			id1 := "e1"
+			env1, err := protocol.NewEnvelope(protocol.TypeExec, protocol.CommandRequest{
+				ID:             id1,
+				Command:        "echo",
+				Args:           []string{"one"},
+				Reason:         "p1",
+				TimeoutSeconds: 5,
+			})
+			if err != nil {
+				t.Fatalf("NewEnvelope 1 failed: %v", err)
+			}
+			if err := enc.Encode(env1); err != nil {
+				t.Fatalf("Encode 1 failed: %v", err)
+			}
+
+			pad := strings.Repeat("p", tc.padSize)
+			id2 := "e2"
+			env2, err := protocol.NewEnvelope(protocol.TypeExec, protocol.CommandRequest{
+				ID:             id2,
+				Command:        "echo",
+				Args:           []string{"2-" + pad},
+				Reason:         "p2",
+				TimeoutSeconds: 5,
+			})
+			if err != nil {
+				t.Fatalf("NewEnvelope 2 failed: %v", err)
+			}
+			if err := enc.Encode(env2); err != nil {
+				t.Fatalf("Encode 2 failed: %v", err)
+			}
+
+			pingID := "pg"
+			env3, err := protocol.NewEnvelope(protocol.TypePing, protocol.PingRequest{
+				ID:        pingID,
+				Timestamp: time.Unix(1700000000, 0).UTC(),
+			})
+			if err != nil {
+				t.Fatalf("NewEnvelope 3 failed: %v", err)
+			}
+			if err := enc.Encode(env3); err != nil {
+				t.Fatalf("Encode 3 failed: %v", err)
+			}
+
+			payload := batch.Bytes()
+			if len(payload) < tc.minLen || len(payload) > tc.maxLen {
+				t.Fatalf("unexpected batch size %d (expected in [%d, %d])", len(payload), tc.minLen, tc.maxLen)
+			}
+
+			// Single write delivering all three pipelined frames back-to-back
+			if _, err := conn.Write(payload); err != nil {
+				t.Fatalf("conn.Write batch failed: %v", err)
+			}
+
+			_ = conn.SetReadDeadline(time.Now().Add(5 * time.Second))
+			dec := json.NewDecoder(conn)
+
+			// 1. Read exec_resp 1
+			var rEnv1 protocol.Envelope
+			if err := dec.Decode(&rEnv1); err != nil {
+				t.Fatalf("Decode resp 1 failed: %v", err)
+			}
+			if rEnv1.Type != protocol.TypeExecResp {
+				t.Fatalf("resp 1: expected exec_resp, got %s", rEnv1.Type)
+			}
+			var r1 protocol.CommandResponse
+			if err := json.Unmarshal(rEnv1.Data, &r1); err != nil {
+				t.Fatalf("Unmarshal resp 1 failed: %v", err)
+			}
+			if r1.ID != id1 || r1.Status != protocol.StatusApproved {
+				t.Fatalf("resp 1 mismatch: id=%q status=%s reason=%q", r1.ID, r1.Status, r1.RejectReason)
+			}
+			if !strings.Contains(r1.Stdout, "one") {
+				t.Fatalf("resp 1 unexpected stdout: %q", r1.Stdout)
+			}
+
+			// 2. Read exec_resp 2
+			var rEnv2 protocol.Envelope
+			if err := dec.Decode(&rEnv2); err != nil {
+				t.Fatalf("Decode resp 2 failed: %v", err)
+			}
+			if rEnv2.Type != protocol.TypeExecResp {
+				t.Fatalf("resp 2: expected exec_resp, got %s", rEnv2.Type)
+			}
+			var r2 protocol.CommandResponse
+			if err := json.Unmarshal(rEnv2.Data, &r2); err != nil {
+				t.Fatalf("Unmarshal resp 2 failed: %v", err)
+			}
+			if r2.ID != id2 || r2.Status != protocol.StatusApproved {
+				t.Fatalf("resp 2 mismatch: id=%q status=%s reason=%q", r2.ID, r2.Status, r2.RejectReason)
+			}
+			if !strings.Contains(r2.Stdout, "2-"+pad) {
+				t.Fatalf("resp 2 missing padded stdout (len=%d)", len(r2.Stdout))
+			}
+
+			// 3. Read ping_resp 3
+			var rEnv3 protocol.Envelope
+			if err := dec.Decode(&rEnv3); err != nil {
+				t.Fatalf("Decode resp 3 (ping) failed: %v", err)
+			}
+			if rEnv3.Type != protocol.TypePingResp {
+				t.Fatalf("resp 3: expected ping_resp, got %s", rEnv3.Type)
+			}
+			var r3 protocol.PingResponse
+			if err := json.Unmarshal(rEnv3.Data, &r3); err != nil {
+				t.Fatalf("Unmarshal resp 3 failed: %v", err)
+			}
+			if r3.ID != pingID || !r3.Active {
+				t.Fatalf("resp 3 ping mismatch: %+v", r3)
+			}
+		})
 	}
 }
