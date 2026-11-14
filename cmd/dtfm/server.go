@@ -339,8 +339,8 @@ func watchDisconnect(conn net.Conn, br *bufio.Reader, cancel context.CancelCause
 					if shutdownCtx != nil && shutdownCtx.Err() != nil {
 						return
 					}
-					close(disconnectCh)
 					cancel(ErrClientDisconnected)
+					close(disconnectCh)
 					return
 				}
 			}
@@ -355,8 +355,8 @@ func watchDisconnect(conn net.Conn, br *bufio.Reader, cancel context.CancelCause
 				if shutdownCtx != nil && shutdownCtx.Err() != nil {
 					return
 				}
-				close(disconnectCh)
 				cancel(ErrClientDisconnected)
+				close(disconnectCh)
 				return
 			}
 
