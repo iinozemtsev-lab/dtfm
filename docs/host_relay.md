@@ -55,9 +55,9 @@ Instead, start `dtfm` on the VPS over a dedicated SSH-forwarded Unix socket from
 ### Step 1: Start `dtfm` on the VPS from Your Laptop
 
 > [!NOTE]
-> If `dtfm` is not yet installed on your VPS, install and verify it in one command first:
+> If `dtfm` is not yet installed on your VPS, install it in one command first:
 > ```bash
-> ssh <vps-user>@<vps-ip> 'os="$(uname -s | tr "[:upper:]" "[:lower:]")" && arch="$(uname -m | sed -e "s/x86_64/amd64/" -e "s/aarch64/arm64/")" && tmp="$(mktemp -d)" && (cd "$tmp" && curl -fsSLO "https://github.com/iinozemtsev-lab/dtfm/releases/latest/download/dtfm-${os}-${arch}" && curl -fsSLO "https://github.com/iinozemtsev-lab/dtfm/releases/latest/download/SHA256SUMS" && grep -E "^[0-9a-f]{64}  dtfm-${os}-${arch}\$" SHA256SUMS | sha256sum -c - && mkdir -p ~/.local/bin && install -m 0755 "dtfm-${os}-${arch}" ~/.local/bin/dtfm); rc=$?; rm -rf "$tmp"; exit $rc'
+> ssh <vps-user>@<vps-ip> 'curl -fsSL https://raw.githubusercontent.com/iinozemtsev-lab/dtfm/main/scripts/install.sh | sh -s -- dtfm'
 > ```
 
 Run this command in a terminal on your Linux or macOS developer laptop:
@@ -80,7 +80,7 @@ Why this command uses explicit paths and a dedicated socket directory:
 Paste this into your local agent's chat (replacing `relay.example.com` with your target domain):
 
 ```text
-Read https://raw.githubusercontent.com/iinozemtsev-lab/dtfm/main/docs/lmdtfy_guide.md (install lmdtfy locally if needed) and https://raw.githubusercontent.com/iinozemtsev-lab/dtfm/main/docs/host_relay.md, then provision relay.example.com on the VPS using `lmdtfy ping --socket "/tmp/dtfm-vps-$(id -u)/lmdtfy.sock"` and `lmdtfy exec --socket "/tmp/dtfm-vps-$(id -u)/lmdtfy.sock" --why "<reason>" -- <cmd>`: execute Sections 3–6 (and Section 7 if auto-updates are desired), wrapping any compound/pipe/heredoc shell commands in `bash -c '...'` since dtfm uses direct execvp, and finish by verifying `https://relay.example.com/healthz` (Section 8, Test 1 — do not launch the interactive `dtfm --relay` listener in Test 2).
+Read https://raw.githubusercontent.com/iinozemtsev-lab/dtfm/main/docs/agent.md (install lmdtfy locally if needed) and https://raw.githubusercontent.com/iinozemtsev-lab/dtfm/main/docs/host_relay.md, then provision relay.example.com on the VPS using `lmdtfy ping --socket "/tmp/dtfm-vps-$(id -u)/lmdtfy.sock"` and `lmdtfy exec --socket "/tmp/dtfm-vps-$(id -u)/lmdtfy.sock" --why "<reason>" -- <cmd>`: execute Sections 3–6 (and Section 7 if auto-updates are desired), wrapping any compound/pipe/heredoc shell commands in `bash -c '...'` since dtfm uses direct execvp, and finish by verifying `https://relay.example.com/healthz` (Section 8, Test 1 — do not launch the interactive `dtfm --relay` listener in Test 2).
 ```
 
 > [!IMPORTANT]
@@ -175,20 +175,10 @@ In this runbook, we install the `relay` binary to `/usr/local/bin/dtfm-relay` to
 
 ### 1-Line Verified Installation
 
-Run this snippet on the VPS to detect architecture, download the latest `relay` binary alongside `SHA256SUMS`, cryptographically verify the exact asset checksum, and install it to `/usr/local/bin/dtfm-relay`:
+Run this snippet on the VPS to detect architecture, download the latest `relay` binary alongside `SHA256SUMS`, cryptographically verify its checksum, and install it to `/usr/local/bin/dtfm-relay`:
 
 ```bash
-(
-  OS="$(uname -s | tr '[:upper:]' '[:lower:]')" && \
-  ARCH="$(uname -m | sed -e 's/x86_64/amd64/' -e 's/aarch64/arm64/')" && \
-  TMP_DIR="$(mktemp -d)" && \
-  trap 'rm -rf "$TMP_DIR"' EXIT && \
-  cd "$TMP_DIR" && \
-  curl -fsSLO "https://github.com/iinozemtsev-lab/dtfm/releases/latest/download/relay-${OS}-${ARCH}" && \
-  curl -fsSLO "https://github.com/iinozemtsev-lab/dtfm/releases/latest/download/SHA256SUMS" && \
-  grep -E "^[0-9a-f]{64}  relay-${OS}-${ARCH}\$" SHA256SUMS | sha256sum -c - && \
-  sudo install -m 0755 "relay-${OS}-${ARCH}" /usr/local/bin/dtfm-relay
-)
+curl -fsSL https://raw.githubusercontent.com/iinozemtsev-lab/dtfm/main/scripts/install.sh | sudo sh -s -- --dir /usr/local/bin relay
 ```
 
 ### Verify Binary Installation

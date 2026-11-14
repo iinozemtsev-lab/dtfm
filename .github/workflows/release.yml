@@ -187,6 +187,8 @@ jobs:
           fi
           go vet ./...
           go test -v -race ./...
+          sh -n scripts/install.sh
+          PYTHONDONTWRITEBYTECODE=1 python3 -W error scripts/test_install.py
           PYTHONDONTWRITEBYTECODE=1 python3 -W error scripts/test_extract_changelog.py
           PYTHONDONTWRITEBYTECODE=1 python3 -W error scripts/test_finalize_changelog.py
           echo "✓ All pre-release quality gates passed."

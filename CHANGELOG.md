@@ -9,6 +9,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 - Automatic operator WebSocket reconnection with jittered exponential backoff (`1s`–`5s`) in `dtfm --relay`, preserving active Magic Links and session IDs across relay idle-timeout evictions, server restarts, and transient network drops with connection-generation isolation and immediate shutdown cancellation.
+- Pipe-safe POSIX installer (`scripts/install.sh`) with rate-limit-free release tag resolution, `SHA256SUMS` verification, `relay` to `dtfm-relay` binary mapping, symlink guard, atomic binary staging, and hermetic local HTTP test suite (`scripts/test_install.py`) wired into CI.
+- Concise agent operational guide (`docs/agent.md`), replacing the verbose `docs/lmdtfy_guide.md`.
 
 ### Changed
 - Rendered multiline command arguments inside a numbered left gutter (`1 │ ...`) in `dtfm` approval prompts and compact line-count badges (`‹arg[N]: M lines›`) in execution banners instead of single-line `$'...\n...'` ANSI-C walls of text, highlighting escaped control/bidi characters in bold red and disabling single-line `[e]` inline editing on multiline invocations in favor of `[y]` Run / `[n]` Reject.
