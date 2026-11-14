@@ -80,7 +80,7 @@ Why this command uses explicit paths and a dedicated socket directory:
 Paste this into your local agent's chat (replacing `relay.example.com` with your target domain):
 
 ```text
-Read docs/lmdtfy_guide.md (install lmdtfy locally if needed) and docs/host_relay.md, then provision relay.example.com on the VPS using `lmdtfy ping --socket "/tmp/dtfm-vps-$(id -u)/lmdtfy.sock"` and `lmdtfy exec --socket "/tmp/dtfm-vps-$(id -u)/lmdtfy.sock" --why "<reason>" -- <cmd>`: execute Sections 3–6 (and Section 7 if auto-updates are desired), wrapping any compound/pipe/heredoc shell commands in `bash -c '...'` since dtfm uses direct execvp, and finish by verifying `https://relay.example.com/healthz` (Section 8, Test 1 — do not launch the interactive `dtfm --relay` listener in Test 2).
+Read https://raw.githubusercontent.com/iinozemtsev-lab/dtfm/main/docs/lmdtfy_guide.md (install lmdtfy locally if needed) and https://raw.githubusercontent.com/iinozemtsev-lab/dtfm/main/docs/host_relay.md, then provision relay.example.com on the VPS using `lmdtfy ping --socket "/tmp/dtfm-vps-$(id -u)/lmdtfy.sock"` and `lmdtfy exec --socket "/tmp/dtfm-vps-$(id -u)/lmdtfy.sock" --why "<reason>" -- <cmd>`: execute Sections 3–6 (and Section 7 if auto-updates are desired), wrapping any compound/pipe/heredoc shell commands in `bash -c '...'` since dtfm uses direct execvp, and finish by verifying `https://relay.example.com/healthz` (Section 8, Test 1 — do not launch the interactive `dtfm --relay` listener in Test 2).
 ```
 
 > [!IMPORTANT]
@@ -193,15 +193,10 @@ Run this snippet on the VPS to detect architecture, download the latest `relay` 
 
 ### Verify Binary Installation
 
-Confirm the binary is installed and executable:
+Confirm the binary is installed, executable, and prints its release version (`dtfm-relay v<X.Y.Z>`):
 
 ```bash
 /usr/local/bin/dtfm-relay --version
-```
-
-Expected output:
-```text
-dtfm-relay v0.3.0
 ```
 
 ---
