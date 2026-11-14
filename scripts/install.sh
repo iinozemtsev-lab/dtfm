@@ -4,6 +4,8 @@
 set -eu
 
 main() {
+    export LC_ALL=C
+
     REPO="${DTFM_REPO:-iinozemtsev-lab/dtfm}"
     GITHUB_URL="${DTFM_GITHUB_URL:-https://github.com}"
     DEST="${DTFM_INSTALL_DIR:-}"
@@ -48,11 +50,11 @@ EOF
     }
 
     cleanup() {
-        if [ -n "${STAGE_FILE:-}" ] && [ -e "$STAGE_FILE" ]; then
-            rm -f "$STAGE_FILE" >/dev/null 2>&1 || true
+        if [ -n "${STAGE_FILE:-}" ]; then
+            rm -f -- "$STAGE_FILE" </dev/null >/dev/null 2>&1 || true
         fi
         if [ -n "${TMP_DIR:-}" ] && [ -d "$TMP_DIR" ]; then
-            rm -rf "$TMP_DIR" >/dev/null 2>&1 || true
+            rm -rf -- "$TMP_DIR" </dev/null >/dev/null 2>&1 || true
         fi
     }
 
@@ -65,7 +67,7 @@ EOF
 
     validate_tag() {
         case "$1" in
-            ""|*[![:print:]]*|*/*|*..*)
+            ""|*..*|*[!0-9A-Za-z.-]*)
                 return 1
                 ;;
         esac
@@ -74,11 +76,39 @@ EOF
 
     validate_repo() {
         case "$1" in
-            ""|*[![:print:]]*|*..*)
+            ""|*/*/*|*..*|*[!0-9A-Za-z._/-]*)
                 return 1
                 ;;
+            */*) ;;
+            *) return 1 ;;
         esac
-        awk -v r="$1" 'BEGIN { exit (r ~ /^[A-Za-z0-9._-]+\/[A-Za-z0-9._-]+$/) ? 0 : 1 }' </dev/null
+        repo_owner="${1%%/*}"
+        repo_name="${1#*/}"
+        case "$repo_owner" in
+            ""|.|..|[!0-9A-Za-z]*|*[!0-9A-Za-z]) return 1 ;;
+        esac
+        case "$repo_name" in
+            ""|.|..|[!0-9A-Za-z]*|*[!0-9A-Za-z]) return 1 ;;
+        esac
+        return 0
+    }
+
+    validate_github_url() {
+        while :; do
+            case "$GITHUB_URL" in
+                */) GITHUB_URL="${GITHUB_URL%/}" ;;
+                *) break ;;
+            esac
+        done
+        case "$GITHUB_URL" in
+            https://*|http://*) ;;
+            *) die "Invalid DTFM_GITHUB_URL (must start with https:// or http://): $GITHUB_URL" ;;
+        esac
+        case "$GITHUB_URL" in
+            *[[:space:]]*|*[[:cntrl:]]*)
+                die "Invalid DTFM_GITHUB_URL (contains whitespace or control characters)."
+                ;;
+        esac
     }
 
     require_arg() {
@@ -199,18 +229,37 @@ EOF
                 DEST="${HOME}/.local/bin"
             fi
         fi
-        DEST="${DEST%/}"
+        while :; do
+            case "$DEST" in
+                /) break ;;
+                */) DEST="${DEST%/}" ;;
+                *) break ;;
+            esac
+        done
         [ -n "$DEST" ] || DEST="/"
+        case "$DEST" in
+            -*) DEST="./$DEST" ;;
+        esac
     }
 
     resolve_latest_tag() {
         latest_url="${GITHUB_URL}/${REPO}/releases/latest"
         if has_cmd curl; then
-            effective_url="$(curl -fsSLI --connect-timeout 10 --max-time 30 -o /dev/null -w '%{url_effective}' "$latest_url" </dev/null)" || \
+            effective_url="$(curl -fsSLI --connect-timeout 10 --max-time 30 -o /dev/null -w '%{url_effective}' -- "$latest_url" </dev/null)" || \
                 die "Failed to resolve latest release from $latest_url"
         elif has_cmd wget; then
-            effective_url="$(wget --spider -S --timeout=30 "$latest_url" </dev/null 2>&1 | awk '/^[[:space:]]*[Ll]ocation:/ { loc=$2 } END { gsub(/\r/, "", loc); print loc }')" || \
+            wget_out="$(wget --spider -S -T 30 -- "$latest_url" </dev/null 2>&1)" || \
                 die "Failed to resolve latest release from $latest_url"
+            effective_url="$(printf '%s\n' "$wget_out" | awk '
+                /^[[:space:]]*[Ll]ocation:[[:space:]]*/ {
+                    line = $0
+                    sub(/^[[:space:]]*[Ll]ocation:[[:space:]]*/, "", line)
+                    sub(/\r$/, "", line)
+                    sub(/[[:space:]].*$/, "", line)
+                    loc = line
+                }
+                END { print loc }
+            ')"
         else
             die "Neither curl nor wget is installed."
         fi
@@ -233,10 +282,10 @@ EOF
         dl_url="$1"
         dl_out="$2"
         if has_cmd curl; then
-            curl -fsSL --connect-timeout 10 --max-time 120 -o "$dl_out" "$dl_url" </dev/null || \
+            curl -fsSL --connect-timeout 10 --max-time 120 -o "$dl_out" -- "$dl_url" </dev/null || \
                 die "Failed to download $dl_url"
         elif has_cmd wget; then
-            wget -q --timeout=120 -O "$dl_out" "$dl_url" </dev/null || \
+            wget -q -T 120 -O "$dl_out" -- "$dl_url" </dev/null || \
                 die "Failed to download $dl_url"
         else
             die "Neither curl nor wget is installed."
@@ -246,11 +295,11 @@ EOF
     compute_sha256() {
         file_path="$1"
         if has_cmd sha256sum; then
-            sha256sum "$file_path" </dev/null | awk '{print tolower($1)}'
+            sha256sum < "$file_path" | awk '{print tolower($1)}'
         elif has_cmd shasum; then
-            shasum -a 256 "$file_path" </dev/null | awk '{print tolower($1)}'
+            shasum -a 256 < "$file_path" | awk '{print tolower($1)}'
         elif has_cmd openssl; then
-            openssl dgst -sha256 "$file_path" </dev/null | awk '{print tolower($NF)}'
+            openssl dgst -sha256 < "$file_path" | awk '{print tolower($NF)}'
         else
             die "No SHA-256 tool found (need sha256sum, shasum, or openssl)."
         fi
@@ -260,6 +309,7 @@ EOF
         sums_file="$1"
         target_asset="$2"
         awk -v target="$target_asset" '
+            { sub(/\r$/, "") }
             /^[0-9a-fA-F]{64} [ *]/ {
                 if (substr($0, 67) == target) {
                     print tolower(substr($0, 1, 64))
@@ -280,11 +330,14 @@ EOF
         esac
     }
 
-    trap cleanup EXIT INT TERM
+    trap cleanup EXIT
+    trap 'exit 130' INT
+    trap 'exit 143' TERM
+    trap 'exit 129' HUP
 
     parse_args "$@"
 
-    GITHUB_URL="${GITHUB_URL%/}"
+    validate_github_url
     validate_repo "$REPO" || die "Invalid repository name: $REPO"
     detect_platform
     resolve_dest
@@ -294,12 +347,15 @@ EOF
     fi
     validate_tag "$TAG" || die "Invalid release tag: $TAG"
 
-    # Upfront symlink guard and idempotent version check before any downloads.
+    # Upfront directory guard, symlink guard, and idempotent version check before any downloads.
     TO_INSTALL=""
     for bin in $COMPONENTS; do
         target="$DEST/$bin"
+        if [ ! -L "$target" ] && [ -d "$target" ]; then
+            die "Refusing to overwrite directory $target."
+        fi
         if [ -L "$target" ] && [ "$FORCE" -ne 1 ]; then
-            link_dest="$(readlink "$target" </dev/null 2>/dev/null || printf 'unknown')"
+            link_dest="$(readlink -- "$target" </dev/null 2>/dev/null || printf 'unknown')"
             die "Refusing to overwrite symlink $target -> $link_dest (pass --force to replace)."
         fi
         if [ "$FORCE" -ne 1 ] && [ -f "$target" ] && [ -x "$target" ]; then
@@ -316,7 +372,7 @@ EOF
         exit 0
     fi
 
-    TMP_DIR="$(mktemp -d)"
+    TMP_DIR="$(mktemp -d)" </dev/null
     BASE_URL="${GITHUB_URL}/${REPO}/releases/download/${TAG}"
     SUMS_PATH="${TMP_DIR}/SHA256SUMS"
 
@@ -336,13 +392,16 @@ EOF
         fi
     done
 
-    mkdir -p "$DEST" </dev/null
+    mkdir -p -- "$DEST" </dev/null
     for bin in $TO_INSTALL; do
         asset="$(asset_for_bin "$bin")"
-        STAGE_FILE="${DEST}/.${bin}.tmp.$$"
-        cp "${TMP_DIR}/${asset}" "$STAGE_FILE" </dev/null
-        chmod 0755 "$STAGE_FILE" </dev/null
-        mv -f "$STAGE_FILE" "${DEST}/${bin}" </dev/null
+        STAGE_FILE="$(mktemp "${DEST}/.${bin}.tmp.XXXXXX")" </dev/null
+        cp -- "${TMP_DIR}/${asset}" "$STAGE_FILE" </dev/null
+        chmod 0755 -- "$STAGE_FILE" </dev/null
+        if [ -L "${DEST}/${bin}" ] && [ -d "${DEST}/${bin}" ]; then
+            rm -f -- "${DEST}/${bin}" </dev/null
+        fi
+        mv -f -- "$STAGE_FILE" "${DEST}/${bin}" </dev/null
         STAGE_FILE=""
         printf 'Installed %s -> %s/%s\n' "$bin" "$DEST" "$bin"
     done

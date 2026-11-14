@@ -11,25 +11,24 @@ command -v lmdtfy >/dev/null || \
   curl -fsSL https://raw.githubusercontent.com/iinozemtsev-lab/dtfm/main/scripts/install.sh | sh -s -- lmdtfy
 ```
 
-Ensure `~/.local/bin` is in `PATH`, then verify an active `dtfm` listener:
+Ensure `~/.local/bin` is in `PATH` (`export PATH="$HOME/.local/bin:$PATH"`), then verify an active `dtfm` listener:
 
 - **Local / SSH Unix socket**: `lmdtfy ping` (or `--socket <path>` / `LMDTFY_SOCKET`)
 - **E2EE Magic Link (relay)**:
   ```sh
-  export LMDTFY_RELAY="<magic-link>"
-  lmdtfy ping
+  lmdtfy ping --relay "<magic-link>"
   ```
-  Or pass `--relay "<magic-link>"` per command (add `--relay-url wss://...` / `LMDTFY_RELAY_URL` only for bare `<session>#<key>` tokens on a self-hosted relay).
+  Or `export LMDTFY_RELAY="<magic-link>"` in persistent shells (stateless tool-runner subshells do not preserve `export` across calls, so pass `--relay "<magic-link>"` per command; add `--relay-url wss://...` / `LMDTFY_RELAY_URL` only for bare `<session>#<key>` tokens on a self-hosted relay).
 
 ## 2. Execution Rules
 
 ```sh
-lmdtfy exec --why "<concise reason>" [--cwd <dir>] [--timeout <sec>] -- <cmd> [args...]
+lmdtfy exec --why "<concise reason>" [--relay "<magic-link>"] [--socket <path>] [--cwd <dir>] [--timeout <sec>] -- <cmd> [args...]
 ```
 
-- **Direct `execvp` (no implicit shell)**: Arguments are executed directly. Wrap pipes (`|`), `&&`, redirects, or heredocs in `sh -c '...'` (or `bash -c '...'`).
+- **Direct `execvp` (no implicit shell)**: Arguments are executed directly. Wrap pipes (`|`), `&&`, redirects, or heredocs in `sh -c '...'` (or `bash -c '...'`), and pass env vars via `env` (e.g., `sudo env DEBIAN_FRONTEND=noninteractive apt-get ...`).
 - **Keep commands reviewable**: State the concrete side effect in `--why`. Prefer declarative writes (`sudo tee /path <<'EOF'`) and batched read-only checks over noisy loops. Multiline commands render with numbered gutters and **cannot** be inline-edited (`[e]`) by the operator—only `[y]` Run or `[n]` Reject.
-- **Child `stdin` is `/dev/null`**: Pass non-interactive flags (`-y`, `--force`, `DEBIAN_FRONTEND=noninteractive`). Authenticators (`sudo`, `ssh`, `gpg`) read operator passwords or Touch ID directly from `/dev/tty`.
+- **Child `stdin` is `/dev/null`**: Pass non-interactive flags (`-y`, `--force`, `sudo env DEBIAN_FRONTEND=noninteractive`). Authenticators (`sudo`, `ssh`, `gpg`) read operator passwords or Touch ID directly from `/dev/tty`.
 - **Check `stderr` for edits**: If the operator uses `[e]` on a single-line command, `lmdtfy` prints `[lmdtfy note: command was modified by user: ...]` on `stderr`.
 - **Timeouts & directory**: Use `--cwd <dir>` to set the working directory and `--timeout <sec>` (default `300`, max `86400`) when commands need longer.
 

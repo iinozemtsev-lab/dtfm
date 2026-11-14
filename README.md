@@ -182,6 +182,9 @@ curl -fsSL https://raw.githubusercontent.com/iinozemtsev-lab/dtfm/main/scripts/i
 # Install only lmdtfy (e.g., inside an agent container), or install dtfm-relay
 curl -fsSL https://raw.githubusercontent.com/iinozemtsev-lab/dtfm/main/scripts/install.sh | sh -s -- lmdtfy
 curl -fsSL https://raw.githubusercontent.com/iinozemtsev-lab/dtfm/main/scripts/install.sh | sudo sh -s -- --dir /usr/local/bin relay
+
+# Pin a specific release version (or set DTFM_VERSION=v0.3.1)
+curl -fsSL https://raw.githubusercontent.com/iinozemtsev-lab/dtfm/main/scripts/install.sh | sh -s -- --version v0.3.1
 ```
 
 ### Prebuilt Release Archives & SLSA Verification
