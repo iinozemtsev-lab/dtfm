@@ -417,21 +417,42 @@ func TestMultilineDisplayAndCompactFormatting(t *testing.T) {
 		t.Fatalf("FormatCompactCommand single-line mismatch: got %q, want %q", got, want)
 	}
 
-	// Multiline badge formatting
+	// Multiline badge formatting and disambiguation against a literal badge-like single-line argument
 	heredoc := "sudo tee /etc/test.conf <<'EOF'\n[Unit]\nDescription=Test\nEOF"
 	if got, want := protocol.FormatCompactCommand("bash", []string{"-c", heredoc}), "bash -c ‹arg[2]: 4 lines›"; got != want {
 		t.Fatalf("FormatCompactCommand multiline mismatch: got %q, want %q", got, want)
+	}
+	if got, want := protocol.FormatCompactCommand("bash", []string{"‹arg[2]: 4 lines›", heredoc}), "bash '‹arg[2]: 4 lines›' ‹arg[2]: 4 lines›"; got != want {
+		t.Fatalf("FormatCompactCommand literal-badge disambiguation mismatch:\ngot:  %q\nwant: %q", got, want)
 	}
 	if got, want := protocol.FormatCompactCommand("evil\nbin", []string{"arg"}), "‹cmd: 2 lines› arg"; got != want {
 		t.Fatalf("FormatCompactCommand multiline cmd mismatch: got %q, want %q", got, want)
 	}
 
-	// SanitizeDisplayLine: natural quotes/backslashes, expanded tabs, highlighted control/bidi/invalid UTF-8 escapes
+	tokens, multilineCount := protocol.InspectCommandTokens("bash", []string{"‹arg[2]: 4 lines›", heredoc})
+	if multilineCount != 1 || len(tokens) != 3 {
+		t.Fatalf("InspectCommandTokens unexpected counts: multilineCount=%d len=%d", multilineCount, len(tokens))
+	}
+	if tokens[1].Multiline || tokens[1].Quoted != "'‹arg[2]: 4 lines›'" || tokens[2].Badge != "‹arg[2]: 4 lines›" || tokens[2].LineCount != 4 {
+		t.Fatalf("InspectCommandTokens unexpected token metadata: %+v", tokens)
+	}
+
+	// SanitizeDisplayLine & SanitizeDisplayLinePair: natural quotes/backslashes, expanded tabs, highlighted escapes
 	wrap := func(s string) string { return "[ESC:" + s + "]" }
 	rawLine := "grep -E '^[0-9]+$' \"file\"\t\r\x1b[2K\u202e\x00" + string([]byte{0xff})
-	gotLine := protocol.SanitizeDisplayLine(rawLine, wrap)
-	wantLine := `grep -E '^[0-9]+$' "file"    [ESC:\r][ESC:\x1b][2K[ESC:\u202e][ESC:\x00][ESC:\xff]`
-	if gotLine != wantLine {
-		t.Fatalf("SanitizeDisplayLine mismatch:\ngot:  %q\nwant: %q", gotLine, wantLine)
+	gotStyled, gotPlain := protocol.SanitizeDisplayLinePair(rawLine, wrap)
+	wantStyled := `grep -E '^[0-9]+$' "file"    [ESC:\r][ESC:\x1b][2K[ESC:\u202e][ESC:\x00][ESC:\xff]`
+	wantPlain := `grep -E '^[0-9]+$' "file"    \r\x1b[2K\u202e\x00\xff`
+	if gotStyled != wantStyled {
+		t.Fatalf("SanitizeDisplayLinePair styled mismatch:\ngot:  %q\nwant: %q", gotStyled, wantStyled)
+	}
+	if gotPlain != wantPlain {
+		t.Fatalf("SanitizeDisplayLinePair plain mismatch:\ngot:  %q\nwant: %q", gotPlain, wantPlain)
+	}
+	if got := protocol.SanitizeDisplayLine(rawLine, nil); got != wantPlain {
+		t.Fatalf("SanitizeDisplayLine(nil) mismatch:\ngot:  %q\nwant: %q", got, wantPlain)
+	}
+	if s, p := protocol.SanitizeDisplayLinePair(rawLine, func(x string) string { return x }); s != wantPlain || p != wantPlain {
+		t.Fatalf("SanitizeDisplayLinePair(identity) mismatch: s=%q p=%q want=%q", s, p, wantPlain)
 	}
 }
