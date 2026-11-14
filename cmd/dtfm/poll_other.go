@@ -9,4 +9,4 @@ import (
 	"golang.org/x/sys/unix"
 )
 
-const pollCloseEvents = unix.POLLHUP | unix.POLLERR
+const pollCloseEvents = unix.POLLHUP | unix.POLLERR | unix.POLLNVAL
