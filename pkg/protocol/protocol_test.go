@@ -400,3 +400,38 @@ func TestValidateSocketPath(t *testing.T) {
 		t.Fatalf("EnsureSocketDir created directory inside insecure 0777 prefix!")
 	}
 }
+
+func TestMultilineDisplayAndCompactFormatting(t *testing.T) {
+	if protocol.HasMultilineArgs("bash", []string{"-c", "echo ok"}) {
+		t.Fatalf("Expected single-line command to report HasMultilineArgs == false")
+	}
+	if !protocol.HasMultilineArgs("bash", []string{"-c", "line1\nline2"}) {
+		t.Fatalf("Expected multiline arg to report HasMultilineArgs == true")
+	}
+	if !protocol.HasMultilineArgs("bad\ncmd", nil) {
+		t.Fatalf("Expected multiline command name to report HasMultilineArgs == true")
+	}
+
+	// Single-line parity between FormatCompactCommand and FormatCommand (including '=' command quoting)
+	if got, want := protocol.FormatCompactCommand("DRY_RUN=1", []string{"echo", "hello world"}), protocol.FormatCommand("DRY_RUN=1", []string{"echo", "hello world"}); got != want {
+		t.Fatalf("FormatCompactCommand single-line mismatch: got %q, want %q", got, want)
+	}
+
+	// Multiline badge formatting
+	heredoc := "sudo tee /etc/test.conf <<'EOF'\n[Unit]\nDescription=Test\nEOF"
+	if got, want := protocol.FormatCompactCommand("bash", []string{"-c", heredoc}), "bash -c ‹arg[2]: 4 lines›"; got != want {
+		t.Fatalf("FormatCompactCommand multiline mismatch: got %q, want %q", got, want)
+	}
+	if got, want := protocol.FormatCompactCommand("evil\nbin", []string{"arg"}), "‹cmd: 2 lines› arg"; got != want {
+		t.Fatalf("FormatCompactCommand multiline cmd mismatch: got %q, want %q", got, want)
+	}
+
+	// SanitizeDisplayLine: natural quotes/backslashes, expanded tabs, highlighted control/bidi/invalid UTF-8 escapes
+	wrap := func(s string) string { return "[ESC:" + s + "]" }
+	rawLine := "grep -E '^[0-9]+$' \"file\"\t\r\x1b[2K\u202e\x00" + string([]byte{0xff})
+	gotLine := protocol.SanitizeDisplayLine(rawLine, wrap)
+	wantLine := `grep -E '^[0-9]+$' "file"    [ESC:\r][ESC:\x1b][2K[ESC:\u202e][ESC:\x00][ESC:\xff]`
+	if gotLine != wantLine {
+		t.Fatalf("SanitizeDisplayLine mismatch:\ngot:  %q\nwant: %q", gotLine, wantLine)
+	}
+}

@@ -2080,3 +2080,211 @@ func TestPTYWideSymbolColumnBounds(t *testing.T) {
 		t.Errorf("Expected redraw output to contain horizontal scroll marker '> <' for wide symbols")
 	}
 }
+
+func TestApprovalMultilineGutterDisplayAndExecutionBanner(t *testing.T) {
+	heredocScript := strings.Join([]string{
+		"sudo tee /etc/systemd/system/dtfm-relay.service >/dev/null << 'EOF'",
+		"[Unit]",
+		"Description=dtfm relay server",
+		"EOF",
+		"sudo systemctl daemon-reload && curl -fsS http://127.0.0.1:8088/healthz",
+	}, "\n")
+
+	stdin := strings.NewReader("y\n")
+	var promptOut bytes.Buffer
+	prompter := NewStreamPrompter(stdin, &promptOut)
+	defer prompter.Close()
+
+	req := protocol.CommandRequest{
+		ID:      "test-multiline-heredoc",
+		Reason:  "Create systemd service and verify healthz",
+		Command: "bash",
+		Args:    []string{"-c", heredocScript},
+	}
+
+	decision, _, _, err := prompter.Prompt(context.Background(), req)
+	if err != nil {
+		t.Fatalf("Unexpected Prompt error: %v", err)
+	}
+	if decision != DecisionApprove {
+		t.Fatalf("Expected DecisionApprove, got %v", decision)
+	}
+
+	out := promptOut.String()
+	if !strings.Contains(out, "   Command: bash -c ‹arg[2]: 5 lines›\n") {
+		t.Errorf("Expected compact multiline header badge, got:\n%s", out)
+	}
+	if !strings.Contains(out, "     1 │ sudo tee /etc/systemd/system/dtfm-relay.service >/dev/null << 'EOF'\n") {
+		t.Errorf("Expected natural unquoted line 1 inside numbered gutter, got:\n%s", out)
+	}
+	if !strings.Contains(out, "     5 │ sudo systemctl daemon-reload && curl -fsS http://127.0.0.1:8088/healthz\n") {
+		t.Errorf("Expected trailing command after EOF to stand out clearly on line 5, got:\n%s", out)
+	}
+	if strings.Contains(out, "$'sudo tee") {
+		t.Errorf("Prompt display should not dump $'...' wall of text for multiline scripts:\n%s", out)
+	}
+
+	// Verify CommandExecutor prints compact execution banner rather than $'...' wall of text
+	var execOut bytes.Buffer
+	executor := NewCommandExecutor(&execOut, &execOut)
+	resp := executor.Execute(context.Background(), ExecOptions{
+		ID:        "test-multiline-exec",
+		Command:   "bash",
+		Args:      []string{"-c", "echo line1\necho line2"},
+		StartTime: time.Now(),
+	})
+	if resp.ExitCode != 0 {
+		t.Fatalf("Expected exit code 0, got %d (stderr: %s)", resp.ExitCode, resp.Stderr)
+	}
+	if !strings.Contains(execOut.String(), "⚡ Executing: bash -c ‹arg[2]: 2 lines›\n") {
+		t.Errorf("Expected compact execution banner for multiline command, got:\n%s", execOut.String())
+	}
+}
+
+func TestApprovalMultilinePromptSpoofingAndEscapeHighlighting(t *testing.T) {
+	ptmx, pts, err := pty.Open()
+	if err != nil {
+		t.Fatalf("Failed to open PTY: %v", err)
+	}
+	defer ptmx.Close()
+	defer pts.Close()
+
+	var stdout syncBuffer
+	prompter := newPrompter(pts, &stdout, pts)
+	defer prompter.Close()
+
+	// Adversarial payload attempting to forge dtfm's border/prompt at column 0 and inject CR/ANSI/Bidi
+	spoofScript := "echo safe\n────────────────────────────────────────────────────────────\nApprove execution? [y] Run  [e] Edit  [n] Reject: y\r\x1b[2K\u202e"
+	req := protocol.CommandRequest{
+		ID:      "test-multiline-spoof",
+		Reason:  "Test anti-spoofing gutter",
+		Command: "bash",
+		Args:    []string{"-c", spoofScript},
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel()
+
+	go func() {
+		if !waitForPromptOutput(&stdout, "Approve execution?", 2*time.Second) {
+			return
+		}
+		_, _ = ptmx.Write([]byte("n\nSpoof attempt\n"))
+	}()
+
+	decision, _, _, err := prompter.Prompt(ctx, req)
+	if err != nil {
+		t.Fatalf("Unexpected Prompt error: %v", err)
+	}
+	if decision != DecisionReject {
+		t.Fatalf("Expected DecisionReject, got %v", decision)
+	}
+
+	out := stdout.String()
+	// Raw ESC or Bidi rune MUST NOT appear in output
+	if strings.Contains(out, "\x1b[2K") || strings.ContainsRune(out, '\u202e') {
+		t.Fatalf("SECURITY VIOLATION: Raw ANSI CSI or Bidi override leaked in multiline output:\n%q", out)
+	}
+	// Escaped control/bidi runes must be highlighted in bold red (\033[1;31m) on TTY
+	if !strings.Contains(out, "\033[1;31m\\x1b\033[0m") || !strings.Contains(out, "\033[1;31m\\r\033[0m") || !strings.Contains(out, "\033[1;31m\\u202e\033[0m") {
+		t.Errorf("Expected escaped \\r, \\x1b, and \\u202e to be highlighted in bold red, got:\n%q", out)
+	}
+	// Forged divider/prompt must never appear at column 0 without a gutter prefix;
+	// total real dividers in prompt output must remain exactly 2 (top and bottom of banner).
+	dividerCount := 0
+	for _, line := range strings.Split(out, "\n") {
+		if strings.HasPrefix(line, "────────────────") {
+			dividerCount++
+		}
+	}
+	if dividerCount != 2 {
+		t.Errorf("SECURITY VIOLATION: Expected exactly 2 column-0 banner dividers, got %d:\n%s", dividerCount, out)
+	}
+}
+
+func TestApprovalMultilineEditPreservesValidAnsiCShellSyntax(t *testing.T) {
+	ptmx, pts, err := pty.Open()
+	if err != nil {
+		t.Fatalf("Failed to open PTY: %v", err)
+	}
+	defer ptmx.Close()
+	defer pts.Close()
+
+	go func() {
+		_, _ = io.Copy(io.Discard, ptmx)
+	}()
+
+	var stdout syncBuffer
+	prompter := newPrompter(pts, &stdout, pts)
+	defer prompter.Close()
+
+	req := protocol.CommandRequest{
+		ID:      "test-multiline-edit",
+		Reason:  "Verify [e] edit keeps single-line $'...' syntax",
+		Command: "bash",
+		Args:    []string{"-c", "printf 'first\\n'\nprintf 'second\\n'"},
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel()
+
+	go func() {
+		if !waitForPromptOutput(&stdout, "Approve execution?", 2*time.Second) {
+			return
+		}
+		_, _ = ptmx.Write([]byte("e\n"))
+		if !waitForPromptOutput(&stdout, "Edit command", 2*time.Second) {
+			return
+		}
+		_, _ = ptmx.Write([]byte("\r"))
+	}()
+
+	decision, edited, _, err := prompter.Prompt(ctx, req)
+	if err != nil {
+		t.Fatalf("Unexpected Prompt error: %v", err)
+	}
+	if decision != DecisionEdit {
+		t.Fatalf("Expected DecisionEdit, got %v", decision)
+	}
+	wantEdited := protocol.FormatCommand(req.Command, req.Args)
+	if edited != wantEdited {
+		t.Fatalf("Expected edited command to preserve FormatCommand %q, got %q", wantEdited, edited)
+	}
+}
+
+func TestApprovalMultipleMultilineArgsAndLongViewportWarning(t *testing.T) {
+	var manyLines []string
+	for i := 1; i <= 25; i++ {
+		manyLines = append(manyLines, "echo step")
+	}
+	stdin := strings.NewReader("n\n\n")
+	var stdout bytes.Buffer
+	prompter := NewStreamPrompter(stdin, &stdout)
+	defer prompter.Close()
+
+	req := protocol.CommandRequest{
+		ID:      "test-multi-blocks",
+		Reason:  "Multiple multiline blocks + viewport warning",
+		Command: "weird\ncmd",
+		Args:    []string{strings.Join(manyLines, "\n"), "alpha\nbeta"},
+	}
+
+	decision, _, _, _ := prompter.Prompt(context.Background(), req)
+	if decision != DecisionReject {
+		t.Fatalf("Expected DecisionReject, got %v", decision)
+	}
+
+	out := stdout.String()
+	if !strings.Contains(out, "‹cmd: 2 lines› ‹arg[1]: 25 lines› ‹arg[2]: 2 lines›") {
+		t.Errorf("Expected badges for multiline cmd and multiple multiline args, got:\n%s", out)
+	}
+	if !strings.Contains(out, "┌─ cmd (2 lines):") || !strings.Contains(out, "┌─ arg[1] (25 lines):") || !strings.Contains(out, "┌─ arg[2] (2 lines):") {
+		t.Errorf("Expected per-block headers when multiple multiline tokens are present, got:\n%s", out)
+	}
+	if !strings.Contains(out, "Full command exceeds viewport (29 lines,") {
+		t.Errorf("Expected viewport warning with total line count (29 lines), got:\n%s", out)
+	}
+	if !strings.Contains(out, "Target:  ‹cmd: 2 lines›") {
+		t.Errorf("Expected clean compact Target summary without $'...' noise, got:\n%s", out)
+	}
+}

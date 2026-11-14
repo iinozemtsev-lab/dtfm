@@ -255,20 +255,105 @@ func SanitizeBannerCommand(s string) string {
 	return b.String()
 }
 
+// QuoteCommandName quotes argv[0] so that a binary name containing '=' (e.g. DRY_RUN=1)
+// is always quoted and never resembles a shell environment assignment prefix.
+func QuoteCommandName(command string) string {
+	cmdQuoted := ShellQuote(command)
+	if strings.Contains(command, "=") && !strings.HasPrefix(cmdQuoted, "'") && !strings.HasPrefix(cmdQuoted, "$'") {
+		cmdQuoted = "'" + strings.ReplaceAll(command, "'", `'\''`) + "'"
+	}
+	return cmdQuoted
+}
+
 // FormatCommand formats a command and its arguments into an unambiguous, lossless shell string.
 // If the command contains '=' (e.g. DRY_RUN=1), it is always quoted to avoid looking like a shell assignment prefix.
 // No bytes from the arguments are ever deleted or stripped.
 func FormatCommand(command string, args []string) string {
 	parts := make([]string, 0, len(args)+1)
-	cmdQuoted := ShellQuote(command)
-	if strings.Contains(command, "=") && !strings.HasPrefix(cmdQuoted, "'") && !strings.HasPrefix(cmdQuoted, "$'") {
-		cmdQuoted = "'" + strings.ReplaceAll(command, "'", `'\''`) + "'"
-	}
-	parts = append(parts, cmdQuoted)
+	parts = append(parts, QuoteCommandName(command))
 	for _, arg := range args {
 		parts = append(parts, ShellQuote(arg))
 	}
 	return strings.Join(parts, " ")
+}
+
+// HasMultilineArgs reports whether command or any element of args contains a newline ('\n').
+func HasMultilineArgs(command string, args []string) bool {
+	if strings.Contains(command, "\n") {
+		return true
+	}
+	for _, arg := range args {
+		if strings.Contains(arg, "\n") {
+			return true
+		}
+	}
+	return false
+}
+
+// FormatCompactCommand formats single-line invocations identically to FormatCommand,
+// while replacing any multiline command/argument token with a concise line-count badge
+// (e.g. "bash -c ‹arg[2]: 37 lines›") suitable for compact headers and execution banners.
+func FormatCompactCommand(command string, args []string) string {
+	if !HasMultilineArgs(command, args) {
+		return FormatCommand(command, args)
+	}
+	parts := make([]string, 0, len(args)+1)
+	if strings.Contains(command, "\n") {
+		parts = append(parts, fmt.Sprintf("‹cmd: %d lines›", strings.Count(command, "\n")+1))
+	} else {
+		parts = append(parts, QuoteCommandName(command))
+	}
+	for i, arg := range args {
+		if strings.Contains(arg, "\n") {
+			parts = append(parts, fmt.Sprintf("‹arg[%d]: %d lines›", i+1, strings.Count(arg, "\n")+1))
+		} else {
+			parts = append(parts, ShellQuote(arg))
+		}
+	}
+	return strings.Join(parts, " ")
+}
+
+// SanitizeDisplayLine sanitizes a single line of a multiline argument for gutter-boxed terminal display.
+// Printable characters (including quotes and backslashes) render naturally without $'...' quoting noise,
+// tabs expand to 4 spaces to avoid right-margin VT100 tab truncation, and all control codes, carriage returns,
+// ANSI escapes, invalid UTF-8 bytes, and Trojan Source bidi/invisible runes are visibly escaped (optionally
+// wrapped by highlightEscape, e.g. bold red on color TTYs). No bytes are ever deleted.
+func SanitizeDisplayLine(line string, highlightEscape func(string) string) string {
+	var b strings.Builder
+	var escBuf strings.Builder
+	writeEsc := func(esc string) {
+		if highlightEscape != nil {
+			b.WriteString(highlightEscape(esc))
+		} else {
+			b.WriteString(esc)
+		}
+	}
+
+	for i := 0; i < len(line); {
+		r, size := utf8.DecodeRuneInString(line[i:])
+		if r == utf8.RuneError && size == 1 {
+			writeEsc(fmt.Sprintf(`\x%02x`, line[i]))
+			i++
+			continue
+		}
+		i += size
+
+		switch {
+		case r == '\t':
+			b.WriteString("    ")
+		case r == '\x1b' || r == '\n' || r == '\r' || r == '\a' || r == '\b' || r == '\v' || r == '\f':
+			escBuf.Reset()
+			escapeRune(&escBuf, r)
+			writeEsc(escBuf.String())
+		case NeedsEscape(r):
+			escBuf.Reset()
+			escapeRune(&escBuf, r)
+			writeEsc(escBuf.String())
+		default:
+			b.WriteRune(r)
+		}
+	}
+	return b.String()
 }
 
 // IsDangerousEnv returns true if the environment variable name poses a security risk

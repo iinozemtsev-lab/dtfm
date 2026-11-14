@@ -208,6 +208,7 @@ func (p *TerminalPrompter) Prompt(ctx context.Context, req protocol.CommandReque
 	// Sanitize all untrusted agent inputs without deleting bytes
 	cleanReason := protocol.SanitizeTerminalText(req.Reason)
 	cleanCmd := protocol.FormatCommand(req.Command, req.Args)
+	displayCmd, totalCmdLines, flatCmdPreview := p.formatCommandDisplay(req, cleanCmd)
 	cleanCwd := protocol.SanitizeTerminalText(req.Cwd)
 	displayCwd := cleanCwd
 	if len([]rune(displayCwd)) > 240 {
@@ -230,7 +231,7 @@ func (p *TerminalPrompter) Prompt(ctx context.Context, req protocol.CommandReque
 	fmt.Fprintln(p.writer, "────────────────────────────────────────────────────────────")
 	fmt.Fprintln(p.writer, "🔔 LMDTFY Command Execution Request:")
 	fmt.Fprintf(p.writer, "   Reason:  %s\n", p.colorBlue(displayReason))
-	fmt.Fprintf(p.writer, "   Command: %s\n", p.colorGreen(cleanCmd))
+	fmt.Fprintf(p.writer, "   Command: %s\n", displayCmd)
 	if cleanCwd != "" {
 		cwdWarning := ""
 		if st, err := os.Stat(req.Cwd); err != nil || !st.IsDir() {
@@ -271,12 +272,19 @@ func (p *TerminalPrompter) Prompt(ctx context.Context, req protocol.CommandReque
 		}
 	}
 	fmt.Fprintln(p.writer, "────────────────────────────────────────────────────────────")
-	if len(cleanCmd) > 300 || len(cleanReason) > 300 || len(cleanCwd) > 200 {
+	if totalCmdLines > 20 || len(cleanCmd) > 300 || len(cleanReason) > 300 || len(cleanCwd) > 200 {
 		cmdRunes := []rune(cleanCmd)
-		cmdPreview := cleanCmd
-		if len(cmdRunes) > 160 {
-			cmdPreview = string(cmdRunes[:100]) + " ... [truncated] ... " + string(cmdRunes[len(cmdRunes)-60:])
-			fmt.Fprintf(p.writer, "   %s\n", p.colorRed(fmt.Sprintf("⚠️  Full command exceeds viewport (%d chars, %d args) — scroll up to inspect before approving", len(cmdRunes), len(req.Args))))
+		previewRunes := []rune(flatCmdPreview)
+		cmdPreview := flatCmdPreview
+		if len(previewRunes) > 160 {
+			cmdPreview = string(previewRunes[:100]) + " ... [truncated] ... " + string(previewRunes[len(previewRunes)-60:])
+		}
+		if totalCmdLines > 20 || len(cmdRunes) > 160 {
+			if totalCmdLines > 1 {
+				fmt.Fprintf(p.writer, "   %s\n", p.colorRed(fmt.Sprintf("⚠️  Full command exceeds viewport (%d lines, %d chars, %d args) — scroll up to inspect before approving", totalCmdLines, len(cmdRunes), len(req.Args))))
+			} else {
+				fmt.Fprintf(p.writer, "   %s\n", p.colorRed(fmt.Sprintf("⚠️  Full command exceeds viewport (%d chars, %d args) — scroll up to inspect before approving", len(cmdRunes), len(req.Args))))
+			}
 		}
 		if cleanCwd != "" {
 			fmt.Fprintf(p.writer, "   Target:  %s (cwd: %s)\n", cmdPreview, targetCwd)
@@ -401,4 +409,79 @@ func (p *TerminalPrompter) Prompt(ctx context.Context, req protocol.CommandReque
 			p.mu.Unlock()
 		}
 	}
+}
+
+// formatCommandDisplay renders single-line commands inline via FormatCommand, and renders
+// multiline arguments inside a numbered left gutter ("   1 │ ...") so heredocs and scripts
+// remain effortless to audit without compromising terminal-escape or prompt-spoofing defenses.
+func (p *TerminalPrompter) formatCommandDisplay(req protocol.CommandRequest, cleanCmd string) (display string, totalLines int, flatPreview string) {
+	if !protocol.HasMultilineArgs(req.Command, req.Args) {
+		return p.colorGreen(cleanCmd), 1, cleanCmd
+	}
+
+	multilineTokens := 0
+	if strings.Contains(req.Command, "\n") {
+		multilineTokens++
+	}
+	for _, arg := range req.Args {
+		if strings.Contains(arg, "\n") {
+			multilineTokens++
+		}
+	}
+
+	headerParts := make([]string, 0, len(req.Args)+1)
+	if strings.Contains(req.Command, "\n") {
+		n := strings.Count(req.Command, "\n") + 1
+		headerParts = append(headerParts, p.colorRed(fmt.Sprintf("‹cmd: %d lines›", n)))
+	} else {
+		headerParts = append(headerParts, p.colorGreen(protocol.QuoteCommandName(req.Command)))
+	}
+	for i, arg := range req.Args {
+		if strings.Contains(arg, "\n") {
+			n := strings.Count(arg, "\n") + 1
+			headerParts = append(headerParts, p.colorBlue(fmt.Sprintf("‹arg[%d]: %d lines›", i+1, n)))
+		} else {
+			headerParts = append(headerParts, p.colorGreen(protocol.ShellQuote(arg)))
+		}
+	}
+
+	var b strings.Builder
+	b.WriteString(strings.Join(headerParts, " "))
+
+	var previewSegments []string
+	appendBlock := func(label string, isCmd bool, raw string) {
+		lines := strings.Split(raw, "\n")
+		totalLines += len(lines)
+		if isCmd {
+			fmt.Fprintf(&b, "\n     %s", p.colorRed(fmt.Sprintf("┌─ %s (%d lines):", label, len(lines))))
+		} else if multilineTokens > 1 {
+			fmt.Fprintf(&b, "\n     %s", p.colorBlue(fmt.Sprintf("┌─ %s (%d lines):", label, len(lines))))
+		}
+		numWidth := len(fmt.Sprintf("%d", len(lines)))
+		if numWidth < 4 {
+			numWidth = 4
+		}
+		for idx, line := range lines {
+			gutter := p.colorDim(fmt.Sprintf("  %*d │ ", numWidth, idx+1))
+			fmt.Fprintf(&b, "\n%s%s", gutter, protocol.SanitizeDisplayLine(line, p.colorRed))
+			if trimmed := strings.TrimSpace(protocol.SanitizeDisplayLine(line, nil)); trimmed != "" {
+				previewSegments = append(previewSegments, trimmed)
+			}
+		}
+	}
+
+	if strings.Contains(req.Command, "\n") {
+		appendBlock("cmd", true, req.Command)
+	}
+	for i, arg := range req.Args {
+		if strings.Contains(arg, "\n") {
+			appendBlock(fmt.Sprintf("arg[%d]", i+1), false, arg)
+		}
+	}
+
+	flatPreview = protocol.FormatCompactCommand(req.Command, req.Args)
+	if len(previewSegments) > 0 {
+		flatPreview += " — " + strings.Join(previewSegments, " ↵ ")
+	}
+	return b.String(), totalLines, flatPreview
 }
