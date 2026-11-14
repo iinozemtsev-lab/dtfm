@@ -30,9 +30,12 @@ const (
 	pingPeriod                 = (pongWait * 9) / 10
 	maxReadBufferCap           = protocol.MaxMessageDataBytes + 128*1024
 	maxWriteBufferCap          = protocol.MaxResponseEnvelopeBytes
-	handshakeWait              = 15 * time.Second
+	maxOperatorWSReadBytes     = 6 * 1024 * 1024
+	defaultHandshakeTimeout    = 10 * time.Second
 	defaultReconnectMinBackoff = 1 * time.Second
 	defaultReconnectMaxBackoff = 5 * time.Second
+	wsCloseCodeForbidden       = 4003
+	wsCloseCodeBadRequest      = 4000
 )
 
 type relayAddr struct {
@@ -69,6 +72,7 @@ type RelayListener struct {
 	logMu         sync.Mutex
 	acceptCh      chan net.Conn
 	doneCh        chan struct{}
+	pumpDone      chan struct{}
 	ctx           context.Context
 	cancel        context.CancelFunc
 	closeOnce     sync.Once
@@ -120,9 +124,12 @@ func DialRelayListenerWithOptions(relayWsURL, sessionID string, secretKey []byte
 	var dialer websocket.Dialer
 	if opts != nil && opts.Dialer != nil {
 		dialer = *opts.Dialer
+		if dialer.HandshakeTimeout <= 0 {
+			dialer.HandshakeTimeout = defaultHandshakeTimeout
+		}
 	} else {
 		dialer = *websocket.DefaultDialer
-		dialer.HandshakeTimeout = 10 * time.Second
+		dialer.HandshakeTimeout = defaultHandshakeTimeout
 	}
 
 	ctx, cancel := context.WithCancel(context.Background())
@@ -136,7 +143,7 @@ func DialRelayListenerWithOptions(relayWsURL, sessionID string, secretKey []byte
 			}
 			switch resp.StatusCode {
 			case http.StatusForbidden:
-				return nil, fmt.Errorf("relay authentication failed: invalid token or session mismatch (HTTP 403 Forbidden)")
+				return nil, formatRelayForbiddenError()
 			case http.StatusServiceUnavailable:
 				return nil, fmt.Errorf("relay server is at maximum session capacity (HTTP 503)")
 			default:
@@ -146,7 +153,7 @@ func DialRelayListenerWithOptions(relayWsURL, sessionID string, secretKey []byte
 		return nil, fmt.Errorf("failed to connect to relay server at %s: %w", relayWsURL, err)
 	}
 
-	wsConn.SetReadLimit(6 * 1024 * 1024)
+	wsConn.SetReadLimit(maxOperatorWSReadBytes)
 
 	minBackoff := defaultReconnectMinBackoff
 	maxBackoff := defaultReconnectMaxBackoff
@@ -178,12 +185,13 @@ func DialRelayListenerWithOptions(relayWsURL, sessionID string, secretKey []byte
 		logWriter:    logWriter,
 		acceptCh:     make(chan net.Conn, 16),
 		doneCh:       make(chan struct{}),
+		pumpDone:     make(chan struct{}),
 		ctx:          ctx,
 		cancel:       cancel,
 	}
 
 	// Read pump & auto-reconnect loop (manages per-connection pingLoop)
-	go rl.readPump()
+	go rl.readPump(wsConn, 1)
 
 	return rl, nil
 }
@@ -194,6 +202,9 @@ func (l *RelayListener) logf(format string, args ...any) {
 	}
 	l.logMu.Lock()
 	defer l.logMu.Unlock()
+	if l.closed.Load() {
+		return
+	}
 	_, _ = fmt.Fprintf(l.logWriter, format, args...)
 }
 
@@ -210,11 +221,30 @@ func isPermanentHTTPStatus(code int) bool {
 	}
 }
 
+func formatRelayForbiddenError() error {
+	return fmt.Errorf("relay authentication failed: invalid token or session mismatch (HTTP 403 Forbidden)")
+}
+
 func formatPermanentRelayError(code int, err error) error {
 	if code == http.StatusForbidden {
-		return fmt.Errorf("relay authentication failed: invalid token or session mismatch (HTTP 403 Forbidden)")
+		return formatRelayForbiddenError()
 	}
 	return fmt.Errorf("relay connection rejected permanently (HTTP %d): %w", code, err)
+}
+
+func isPermanentWSCloseError(err error) (error, bool) {
+	var closeErr *websocket.CloseError
+	if !errors.As(err, &closeErr) {
+		return nil, false
+	}
+	switch closeErr.Code {
+	case wsCloseCodeForbidden:
+		return formatRelayForbiddenError(), true
+	case wsCloseCodeBadRequest:
+		return fmt.Errorf("relay connection rejected permanently (close %d: %s)", closeErr.Code, closeErr.Text), true
+	default:
+		return nil, false
+	}
 }
 
 func jitteredDuration(d time.Duration) time.Duration {
@@ -224,6 +254,42 @@ func jitteredDuration(d time.Duration) time.Duration {
 	// +/- 20% jitter: multiplier in [0.8, 1.2)
 	jitter := 0.8 + rand.Float64()*0.4
 	return time.Duration(float64(d) * jitter)
+}
+
+func (l *RelayListener) writeWS(ws *websocket.Conn, gen uint64, msgType int, data []byte, deadline time.Time) error {
+	if !deadline.IsZero() && !time.Now().Before(deadline) {
+		return os.ErrDeadlineExceeded
+	}
+
+	l.wsWriteMu.Lock()
+	defer l.wsWriteMu.Unlock()
+
+	if l.closed.Load() || l.wsConn == nil || l.wsConn != ws || l.connGen != gen {
+		return net.ErrClosed
+	}
+
+	if !deadline.IsZero() && !time.Now().Before(deadline) {
+		return os.ErrDeadlineExceeded
+	}
+
+	effectiveDeadline := deadline
+	if effectiveDeadline.IsZero() {
+		effectiveDeadline = time.Now().Add(writeWait)
+	}
+	_ = ws.SetWriteDeadline(effectiveDeadline)
+
+	if err := ws.WriteMessage(msgType, data); err != nil {
+		_ = ws.Close()
+		if l.wsConn == ws {
+			l.wsConn = nil
+		}
+		var netErr net.Error
+		if errors.As(err, &netErr) && netErr.Timeout() {
+			return os.ErrDeadlineExceeded
+		}
+		return err
+	}
+	return nil
 }
 
 func (l *RelayListener) pingLoop(ws *websocket.Conn, gen uint64, connDone <-chan struct{}) {
@@ -237,15 +303,7 @@ func (l *RelayListener) pingLoop(ws *websocket.Conn, gen uint64, connDone <-chan
 		case <-connDone:
 			return
 		case <-ticker.C:
-			l.wsWriteMu.Lock()
-			if l.closed.Load() || l.wsConn != ws || l.connGen != gen {
-				l.wsWriteMu.Unlock()
-				return
-			}
-			_ = ws.SetWriteDeadline(time.Now().Add(writeWait))
-			err := ws.WriteMessage(websocket.PingMessage, nil)
-			l.wsWriteMu.Unlock()
-			if err != nil {
+			if err := l.writeWS(ws, gen, websocket.PingMessage, nil, time.Now().Add(writeWait)); err != nil {
 				return
 			}
 		}
@@ -253,27 +311,29 @@ func (l *RelayListener) pingLoop(ws *websocket.Conn, gen uint64, connDone <-chan
 }
 
 func (l *RelayListener) sendKickAgentForConn(ws *websocket.Conn, gen uint64, connID uint64) {
-	l.wsWriteMu.Lock()
-	defer l.wsWriteMu.Unlock()
-	if l.closed.Load() || l.wsConn == nil || l.wsConn != ws || l.connGen != gen {
-		return
-	}
-
 	hdr := make([]byte, 9)
 	hdr[0] = e2ee.FrameKickAgent
 	binary.BigEndian.PutUint64(hdr[1:9], connID)
-	_ = ws.SetWriteDeadline(time.Now().Add(writeWait))
-	_ = ws.WriteMessage(websocket.BinaryMessage, hdr)
+	_ = l.writeWS(ws, gen, websocket.BinaryMessage, hdr, time.Now().Add(writeWait))
 }
 
-func (l *RelayListener) readPump() {
-	ws := l.wsConn
-	gen := l.connGen
+func (l *RelayListener) readPump(ws *websocket.Conn, gen uint64) {
+	defer close(l.pumpDone)
 
 	for {
-		l.runConnection(ws, gen)
+		readErr := l.runConnection(ws, gen)
 
 		if l.closed.Load() {
+			return
+		}
+
+		if permErr, ok := isPermanentWSCloseError(readErr); ok {
+			l.mu.Lock()
+			if l.disconnectErr == nil {
+				l.disconnectErr = permErr
+			}
+			l.mu.Unlock()
+			l.closeInternal()
 			return
 		}
 
@@ -287,7 +347,7 @@ func (l *RelayListener) readPump() {
 					l.disconnectErr = err
 				}
 				l.mu.Unlock()
-				_ = l.Close()
+				l.closeInternal()
 			}
 			return
 		}
@@ -337,7 +397,7 @@ func (l *RelayListener) reconnectLoop() (*websocket.Conn, error) {
 
 		ws, resp, err := l.dialer.DialContext(l.ctx, l.dialURL, l.dialHeaders.Clone())
 		if err == nil {
-			ws.SetReadLimit(6 * 1024 * 1024)
+			ws.SetReadLimit(maxOperatorWSReadBytes)
 			return ws, nil
 		}
 		if resp != nil && resp.Body != nil {
@@ -359,7 +419,7 @@ func (l *RelayListener) reconnectLoop() (*websocket.Conn, error) {
 	}
 }
 
-func (l *RelayListener) runConnection(ws *websocket.Conn, gen uint64) {
+func (l *RelayListener) runConnection(ws *websocket.Conn, gen uint64) error {
 	connDone := make(chan struct{})
 	go l.pingLoop(ws, gen, connDone)
 
@@ -392,7 +452,7 @@ func (l *RelayListener) runConnection(ws *websocket.Conn, gen uint64) {
 		_ = ws.SetReadDeadline(time.Now().Add(pongWait))
 		msgType, msg, err := ws.ReadMessage()
 		if err != nil {
-			return
+			return err
 		}
 
 		if msgType != websocket.BinaryMessage || len(msg) < 9 {
@@ -426,24 +486,19 @@ func (l *RelayListener) runConnection(ws *websocket.Conn, gen uint64) {
 			binary.BigEndian.PutUint64(outFrame[1:9], connID)
 			copy(outFrame[9:], opHandshakePacket)
 
-			l.wsWriteMu.Lock()
-			var writeErr error
-			if l.closed.Load() || l.wsConn != ws || l.connGen != gen {
-				writeErr = net.ErrClosed
-			} else {
-				_ = ws.SetWriteDeadline(time.Now().Add(writeWait))
-				writeErr = ws.WriteMessage(websocket.BinaryMessage, outFrame)
-			}
-			l.wsWriteMu.Unlock()
-
-			if writeErr != nil {
+			if writeErr := l.writeWS(ws, gen, websocket.BinaryMessage, outFrame, time.Now().Add(writeWait)); writeErr != nil {
 				conn.kickAndClose()
-				continue
+				return writeErr
+			}
+
+			if l.closed.Load() {
+				conn.kickAndClose()
+				return nil
 			}
 
 			select {
 			case <-l.doneCh:
-				return
+				return nil
 			case l.acceptCh <- conn:
 			default:
 				conn.kickAndClose()
@@ -474,31 +529,45 @@ func (l *RelayListener) runConnection(ws *websocket.Conn, gen uint64) {
 	}
 }
 
+func (l *RelayListener) acceptClosedErr() error {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	if l.disconnectErr != nil {
+		return l.disconnectErr
+	}
+	return net.ErrClosed
+}
+
 func (l *RelayListener) Accept() (net.Conn, error) {
-	select {
-	case <-l.doneCh:
-		l.mu.Lock()
-		defer l.mu.Unlock()
-		if l.disconnectErr != nil {
-			return nil, l.disconnectErr
+	for {
+		select {
+		case <-l.doneCh:
+			return nil, l.acceptClosedErr()
+		default:
 		}
-		return nil, net.ErrClosed
-	case conn, ok := <-l.acceptCh:
-		if !ok {
-			l.mu.Lock()
-			defer l.mu.Unlock()
-			if l.disconnectErr != nil {
-				return nil, l.disconnectErr
+
+		select {
+		case <-l.doneCh:
+			return nil, l.acceptClosedErr()
+		case conn := <-l.acceptCh:
+			if l.closed.Load() {
+				_ = conn.Close()
+				return nil, l.acceptClosedErr()
 			}
-			return nil, net.ErrClosed
+			if rc, ok := conn.(*RelayConn); ok && rc.IsClosedOrEOF() {
+				continue
+			}
+			return conn, nil
 		}
-		return conn, nil
 	}
 }
 
-func (l *RelayListener) Close() error {
+func (l *RelayListener) closeInternal() {
 	l.closeOnce.Do(func() {
+		l.logMu.Lock()
 		l.closed.Store(true)
+		l.logMu.Unlock()
+
 		close(l.doneCh)
 		if l.cancel != nil {
 			l.cancel()
@@ -522,6 +591,13 @@ func (l *RelayListener) Close() error {
 			prev.signalEOF()
 		}
 	})
+}
+
+func (l *RelayListener) Close() error {
+	l.closeInternal()
+	if l.pumpDone != nil {
+		<-l.pumpDone
+	}
 	return nil
 }
 
@@ -546,10 +622,6 @@ type RelayConn struct {
 	writeDeadline time.Time
 	closed        atomic.Bool
 	remoteEOF     atomic.Bool
-}
-
-func newRelayConn(l *RelayListener, connID uint64) *RelayConn {
-	return newRelayConnForGen(l, l.wsConn, l.connGen, connID)
 }
 
 func newRelayConnForGen(l *RelayListener, ws *websocket.Conn, gen uint64, connID uint64) *RelayConn {
@@ -768,23 +840,9 @@ func (c *RelayConn) flushLocked() error {
 	binary.BigEndian.PutUint64(frame[1:9], c.connID)
 	copy(frame[9:], ciphertext)
 
-	c.listener.wsWriteMu.Lock()
-	defer c.listener.wsWriteMu.Unlock()
-
-	if c.listener.closed.Load() || c.listener.wsConn == nil || c.listener.wsConn != c.wsConn || c.listener.connGen != c.connGen {
-		return net.ErrClosed
-	}
-
-	if !c.writeDeadline.IsZero() {
-		_ = c.wsConn.SetWriteDeadline(c.writeDeadline)
-	} else {
-		_ = c.wsConn.SetWriteDeadline(time.Now().Add(writeWait))
-	}
-
-	if err := c.wsConn.WriteMessage(websocket.BinaryMessage, frame); err != nil {
-		var netErr net.Error
-		if errors.As(err, &netErr) && netErr.Timeout() {
-			return os.ErrDeadlineExceeded
+	if err := c.listener.writeWS(c.wsConn, c.connGen, websocket.BinaryMessage, frame, c.writeDeadline); err != nil {
+		if errors.Is(err, net.ErrClosed) || errors.Is(err, os.ErrDeadlineExceeded) {
+			return err
 		}
 		return fmt.Errorf("failed to send frame to relay: %w", err)
 	}
@@ -815,12 +873,7 @@ func (c *RelayConn) Close() error {
 				binary.BigEndian.PutUint64(frame[1:9], c.connID)
 				copy(frame[9:], eofRecord)
 
-				c.listener.wsWriteMu.Lock()
-				if !c.listener.closed.Load() && c.listener.wsConn != nil && c.listener.wsConn == c.wsConn && c.listener.connGen == c.connGen {
-					_ = c.wsConn.SetWriteDeadline(time.Now().Add(2 * time.Second))
-					_ = c.wsConn.WriteMessage(websocket.BinaryMessage, frame)
-				}
-				c.listener.wsWriteMu.Unlock()
+				_ = c.listener.writeWS(c.wsConn, c.connGen, websocket.BinaryMessage, frame, time.Now().Add(writeWait))
 			}
 		}
 

@@ -25,6 +25,10 @@ import (
 	"github.com/iinozemtsev-lab/dtfm/pkg/e2ee"
 )
 
+func newRelayConn(l *RelayListener, connID uint64) *RelayConn {
+	return newRelayConnForGen(l, l.wsConn, l.connGen, connID)
+}
+
 func TestRelayConnConcurrentOperationsAndDeadlines(t *testing.T) {
 	sessionID := "test-concurrent-ops"
 	rawKey, _, _ := e2ee.GenerateSessionKey()
@@ -454,6 +458,13 @@ func TestRelayListenerAutoReconnectEndToEnd(t *testing.T) {
 			return
 		}
 		agentDone <- nil
+
+		// Hold generation-2 connection open until client closes it.
+		for {
+			if _, _, err := ws.ReadMessage(); err != nil {
+				return
+			}
+		}
 	}))
 	defer ts.Close()
 
@@ -683,6 +694,47 @@ func TestRelayListenerPermanent403AbortsReconnect(t *testing.T) {
 	time.Sleep(30 * time.Millisecond)
 	if got := dialAttempts.Load(); got != 2 {
 		t.Fatalf("expected exactly 2 dial attempts (initial + 1 permanent 403), got %d", got)
+	}
+}
+
+func TestRelayListenerPostUpgradeClose4003AbortsReconnect(t *testing.T) {
+	sessionID := "test-close-4003"
+	rawKey, _, _ := e2ee.GenerateSessionKey()
+	upgrader := websocket.Upgrader{CheckOrigin: func(r *http.Request) bool { return true }}
+
+	var dialAttempts atomic.Int32
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		dialAttempts.Add(1)
+		ws, err := upgrader.Upgrade(w, r, nil)
+		if err != nil {
+			return
+		}
+		_ = ws.WriteControl(websocket.CloseMessage,
+			websocket.FormatCloseMessage(wsCloseCodeForbidden, "forbidden"),
+			time.Now().Add(time.Second))
+		_ = ws.Close()
+	}))
+	defer ts.Close()
+
+	wsURL := "ws" + strings.TrimPrefix(ts.URL, "http")
+	rl, err := DialRelayListenerWithOptions(wsURL, sessionID, rawKey, &RelayOptions{
+		MinBackoff: 5 * time.Millisecond,
+		MaxBackoff: 10 * time.Millisecond,
+		LogWriter:  io.Discard,
+	})
+	if err != nil {
+		t.Fatalf("DialRelayListenerWithOptions: %v", err)
+	}
+	defer rl.Close()
+
+	_, err = rl.Accept()
+	if err == nil || !strings.Contains(err.Error(), "403 Forbidden") {
+		t.Fatalf("expected 403 Forbidden error from Accept, got: %v", err)
+	}
+
+	time.Sleep(30 * time.Millisecond)
+	if got := dialAttempts.Load(); got != 1 {
+		t.Fatalf("expected exactly 1 dial attempt (aborted on close 4003), got %d", got)
 	}
 }
 
