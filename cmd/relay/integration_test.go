@@ -116,8 +116,11 @@ func TestEndToEndE2EERelayPingAndExecution(t *testing.T) {
 	var activeConnID uint64
 	var activeOpCipher *e2ee.ConnCipher
 	var opNonce []byte
+	agentDisconnectedCh := make(chan uint64, 4)
+	opLoopDoneCh := make(chan struct{})
 
 	go func() {
+		defer close(opLoopDoneCh)
 		for {
 			msgType, msg, err := opWsConn.ReadMessage()
 			if err != nil {
@@ -155,6 +158,10 @@ func TestEndToEndE2EERelayPingAndExecution(t *testing.T) {
 					activeOpCipher = nil
 				}
 				opCipherMu.Unlock()
+				select {
+				case agentDisconnectedCh <- connID:
+				default:
+				}
 				continue
 			}
 			if ctrl != e2ee.FrameData {
@@ -300,6 +307,15 @@ func TestEndToEndE2EERelayPingAndExecution(t *testing.T) {
 		return agentConn, cipher
 	}
 
+	waitForAgentDisconnect := func(step string) {
+		t.Helper()
+		select {
+		case <-agentDisconnectedCh:
+		case <-time.After(2 * time.Second):
+			t.Fatalf("timed out waiting for hub to unregister agent after %s", step)
+		}
+	}
+
 	// 4. Test Agent: lmdtfy ping over relay
 	agentConn, agentCipher := connectAgent()
 
@@ -334,6 +350,7 @@ func TestEndToEndE2EERelayPingAndExecution(t *testing.T) {
 		t.Fatalf("expected ping_resp, got %s", respEnv.Type)
 	}
 	agentConn.Close()
+	waitForAgentDisconnect("ping")
 
 	// 5. Test Agent: lmdtfy exec (Approved)
 	agentConn, agentCipher = connectAgent()
@@ -376,6 +393,7 @@ func TestEndToEndE2EERelayPingAndExecution(t *testing.T) {
 		t.Fatalf("expected stdout 'e2ee-hello-world\\n', got %q", cmdResp.Stdout)
 	}
 	agentConn.Close()
+	waitForAgentDisconnect("approved exec")
 
 	// 6. Test Agent: lmdtfy exec (Rejected)
 	mockP.decision = "reject"
@@ -411,6 +429,7 @@ func TestEndToEndE2EERelayPingAndExecution(t *testing.T) {
 		t.Fatalf("expected reject reason 'Security policy violation', got %q", cmdResp.RejectReason)
 	}
 	agentConn.Close()
+	waitForAgentDisconnect("rejected exec")
 
 	// 7. Verify Zero-Knowledge Guarantee:
 	plaintextsToCheck := []string{
@@ -429,7 +448,14 @@ func TestEndToEndE2EERelayPingAndExecution(t *testing.T) {
 
 	// 8. Test Operator Disconnect:
 	opWsConn.Close()
-	time.Sleep(50 * time.Millisecond)
+	<-opLoopDoneCh
+	deadline := time.Now().Add(2 * time.Second)
+	for hub.ActiveSessionsCount() != 0 {
+		if time.Now().After(deadline) {
+			t.Fatalf("timed out waiting for hub to evict disconnected operator session (active=%d)", hub.ActiveSessionsCount())
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
 
 	agentWsURL := relayWsURL + "?session=" + sessionID + "&role=agent"
 	_, _, err = websocket.DefaultDialer.Dial(agentWsURL, agentHeader)
