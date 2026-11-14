@@ -193,7 +193,9 @@ func run(args []string, stdout, stderr io.Writer) int {
 			return 1
 		}
 
-		relayListener, err := DialRelayListener(*relayURL, sID, secretKey)
+		relayListener, err := DialRelayListenerWithOptions(*relayURL, sID, secretKey, &RelayOptions{
+			LogWriter: stderr,
+		})
 		if err != nil {
 			fmt.Fprintf(stderr, "Error connecting to relay server: %v\n", err)
 			return 1
