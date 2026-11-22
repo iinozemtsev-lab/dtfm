@@ -7,6 +7,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.5.1] - 2026-11-22
+
 ### Fixed
 - Refresh `dtfm-relay` WebSocket read deadline on incoming binary frames (including browser extension keepalives) so active sessions are not dropped if an RFC 6455 Pong is delayed ([#50](https://github.com/iinozemtsev-lab/dtfm/issues/50)).
 
@@ -79,7 +81,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **Build Infrastructure**:
   - Multi-platform static compilation targets in `Makefile` (`make cross`) for `darwin-arm64`, `darwin-amd64`, `linux-amd64`, and `linux-arm64` (`CGO_ENABLED=0`).
 
-[Unreleased]: https://github.com/iinozemtsev-lab/dtfm/compare/v0.5.0...HEAD
+[Unreleased]: https://github.com/iinozemtsev-lab/dtfm/compare/v0.5.1...HEAD
+[0.5.1]: https://github.com/iinozemtsev-lab/dtfm/compare/v0.5.0...v0.5.1
 [0.5.0]: https://github.com/iinozemtsev-lab/dtfm/compare/v0.4.0...v0.5.0
 [0.4.0]: https://github.com/iinozemtsev-lab/dtfm/compare/v0.3.1...v0.4.0
 [0.3.1]: https://github.com/iinozemtsev-lab/dtfm/compare/v0.3.0...v0.3.1
